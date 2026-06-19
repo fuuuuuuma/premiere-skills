@@ -7,10 +7,10 @@ A1の各クリップの音声で無音検出し、全トラックに同じタイ
 
 import xml.etree.ElementTree as ET
 import subprocess
-import re
 import copy
 import os
 import sys
+import numpy as np
 from urllib.parse import unquote, urlparse
 
 
@@ -43,34 +43,92 @@ def resolve_file_path(clip, file_id_map):
     return None
 
 
-def detect_silence(audio_file, start_sec, duration_sec, threshold_db=-35, min_silence=0.2):
-    """ffmpeg silencedetectで無音区間を検出。返り値は(start_sec, end_sec)のリスト（絶対時間）"""
+def probe_media_fps_duration(path):
+    """実メディアの実fpsと長さ(秒)をffprobeで取得。失敗時は(None, None)。
+
+    XMLが宣言する timebase（例: 29）と実体の fps（例: 29.998）がズレることがある。
+    フレーム→秒換算を実fpsで行わないと、解析窓が実メディア長を超過し末尾を取りこぼす。
+    """
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=avg_frame_rate',
+             '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1', path],
+            capture_output=True, text=True, timeout=120
+        ).stdout
+        fps = None
+        duration = None
+        for line in out.split('\n'):
+            if line.startswith('avg_frame_rate='):
+                v = line.split('=', 1)[1].strip()
+                if '/' in v:
+                    num, den = v.split('/')
+                    if float(den) != 0:
+                        fps = float(num) / float(den)
+                elif v:
+                    fps = float(v)
+            elif line.startswith('duration='):
+                v = line.split('=', 1)[1].strip()
+                if v and v != 'N/A':
+                    duration = float(v)
+        if fps is not None and fps <= 0:
+            fps = None
+        return fps, duration
+    except Exception:
+        return None, None
+
+
+def detect_silence_envelope(audio_file, start_sec, duration_sec,
+                            threshold_db=-50, min_silence=0.2,
+                            sr=16000, win_ms=20):
+    """RMSエンベロープの閾値交差で無音区間を検出（前後対称化の根本対策）。
+
+    silencedetectは発話の『頭』(鋭い立ち上がり)は正確だが『終わり』(緩やかな減衰)を
+    約1f遅れて落とすため、前後で残し量がズレる。これは検出方向ではなく減衰音の
+    終端定義の曖昧さに由来する。そこで前後を同一基準＝1本の中央窓RMSエンベロープの
+    -50dB交差点で定義すると、対称パディングが定義上ぴったり前後同じ残し量になる。
+
+    返り値は (start_sec, end_sec) のリスト（絶対時間・秒）。numpy必須。
+    """
     cmd = [
-        'ffmpeg', '-hide_banner',
+        'ffmpeg', '-hide_banner', '-v', 'error',
         '-ss', str(start_sec),
         '-t', str(duration_sec),
         '-i', audio_file,
-        '-vn',
-        '-af', f'silencedetect=noise={threshold_db}dB:d={min_silence}',
-        '-f', 'null', '-'
+        '-vn', '-ac', '1', '-ar', str(sr),
+        '-f', 's16le', '-'
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    raw = subprocess.run(cmd, capture_output=True, timeout=3600).stdout
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+    if x.size == 0:
+        return []
+
+    # 中央窓RMS（O(N)の累積和で算出）— 前後の端を完全に同一の窓・基準で測る
+    w = max(1, int(sr * win_ms / 1000))
+    csum = np.concatenate(([0.0], np.cumsum(x * x)))
+    idx = np.arange(x.size)
+    lo = np.clip(idx - w // 2, 0, x.size)
+    hi = np.clip(lo + w, 0, x.size)
+    env = np.sqrt(np.maximum((csum[hi] - csum[lo]) / np.maximum(hi - lo, 1), 1e-9))
+
+    thr = 32768.0 * (10 ** (threshold_db / 20.0))
+    quiet = env <= thr  # 無音サンプル
+
+    # 無音ラン（連続quiet）のうち min_silence 以上を抽出。両端は同一交差基準。
+    min_len = max(1, int(round(min_silence * sr)))
+    d = np.diff(quiet.astype(np.int8))
+    starts = list(np.where(d == 1)[0] + 1)
+    ends = list(np.where(d == -1)[0] + 1)
+    if quiet[0]:
+        starts = [0] + starts
+    if quiet[-1]:
+        ends = ends + [x.size]
 
     silences = []
-    silence_start = None
-    for line in result.stderr.split('\n'):
-        if 'silence_start:' in line:
-            m = re.search(r'silence_start:\s*([\d.eE+-]+)', line)
-            if m:
-                silence_start = float(m.group(1)) + start_sec
-        elif 'silence_end:' in line and silence_start is not None:
-            m = re.search(r'silence_end:\s*([\d.eE+-]+)', line)
-            if m:
-                silence_end = float(m.group(1)) + start_sec
-                silences.append((silence_start, silence_end))
-                silence_start = None
-    if silence_start is not None:
-        silences.append((silence_start, start_sec + duration_sec))
+    for s, e in zip(starts, ends):
+        if e - s >= min_len:
+            silences.append((start_sec + s / sr, start_sec + e / sr))
     return silences
 
 
@@ -87,14 +145,16 @@ def main():
     parser.add_argument(
         "--output-dir",
         help="出力ディレクトリ。指定時はこのディレクトリに '<basename>_カット済み.xml' を配置。"
-             "推奨: ~/ClaudeCode/projects/premiere-skills/output/cut/",
+             "推奨: $REPO_DIR/output/cut/",
     )
-    parser.add_argument("--threshold", type=float, default=-35,
+    parser.add_argument("--threshold", type=float, default=-50,
                         help="無音判定の閾値(dB)。小さい値ほど厳しく(=カット減)。ぶつぶつ喋りは -45〜-50 推奨")
     parser.add_argument("--min-silence", type=float, default=0.2,
                         help="無音と判定する最小秒数。大きくすると短い間(ま)を残す")
     parser.add_argument("--padding", type=int, default=2,
                         help="カット前後に残すパディングフレーム数")
+    parser.add_argument("--no-normalize-fps", action="store_true",
+                        help="XML宣言fpsと実素材fpsがズレていても出力rateを補正しない（既定は補正する）")
     args = parser.parse_args()
 
     input_xml = args.input_xml
@@ -109,9 +169,9 @@ def main():
     else:
         output_xml = f"{base}_カット済み{ext}"
 
-    THRESHOLD_DB = -35
-    MIN_SILENCE = 0.2
-    PADDING_FRAMES = 2
+    THRESHOLD_DB = args.threshold
+    MIN_SILENCE = args.min_silence
+    PADDING_FRAMES = args.padding
     TICKS_PER_SECOND = 254016000000
 
     print("=" * 60)
@@ -204,6 +264,7 @@ def main():
     tl_duration = tl_total_end - tl_total_start
 
     all_silence_tl_frames = []
+    a1_real_fps = None  # 正規化用：A1メイン素材の実fps
 
     for ci, a1_clip in enumerate(a1_track['clips']):
         audio_file = a1_clip['filepath']
@@ -212,15 +273,34 @@ def main():
             continue
 
         fname = os.path.basename(audio_file)
+        # 時間↔フレームの換算は必ずシーケンス宣言timebaseで行う。
+        # 音声は実時間で再生され、タイムラインは宣言fps（例: 30.0）で刻むので、
+        # 実音声 T 秒は timeline フレーム T*timebase に置かれる。動画の実fps(例: 29.998)は
+        # 音声配置に無関係。ここで実fpsを使うと毎秒(timebase-実fps)分ずれ、後半ほど累積ドリフトする。
+        # 実fpsは末尾クランプの判定とfps正規化の判断にのみ使う。
+        real_fps, media_dur = probe_media_fps_duration(audio_file)
+        if a1_real_fps is None and real_fps:
+            a1_real_fps = real_fps
         in_sec = a1_clip['in_frame'] / timebase
         dur_sec = (a1_clip['out_frame'] - a1_clip['in_frame']) / timebase
+        # 解析窓を実メディア長でクランプ（窓が実体を超過して末尾を取りこぼすのを防ぐ安全網）
+        if media_dur is not None:
+            max_dur = media_dur - in_sec
+            if max_dur > 0 and dur_sec > max_dur + 0.5:
+                print(f"    ⚠ 解析窓 {in_sec + dur_sec:.1f}s が実メディア長 {media_dur:.1f}s を超過 → クランプ")
+                dur_sec = max_dur
         print(f"  クリップ{ci+1}: {fname}")
+        if real_fps and abs(real_fps - timebase) > 0.01:
+            print(f"    実fps={real_fps:.4f}（宣言timebase={timebase:.4f}）→ 換算は宣言timebase基準（音声は実時間配置）")
         print(f"    解析範囲: {in_sec:.2f}s ～ {in_sec + dur_sec:.2f}s ({dur_sec:.1f}s)")
 
-        silences = detect_silence(audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
+        # 前後を同一基準で検出（中央窓RMSエンベロープの-50dB交差）。
+        # silencedetectは減衰する発話末尾の検出が約1f遅れ前後非対称になるため使わない。
+        silences = detect_silence_envelope(
+            audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
         print(f"    検出無音: {len(silences)}箇所")
 
-        # ソース秒 → タイムラインフレームに変換
+        # 検出秒（実音声時間）→ タイムライン/ソースのフレーム番号（宣言timebase基準）
         for s_start, s_end in silences:
             sf_start = int(round(s_start * timebase))
             sf_end = int(round(s_end * timebase))
@@ -260,11 +340,33 @@ def main():
 
     total_kept = sum(e - s for s, e in keep_tl_regions)
     total_cut = tl_duration - total_kept
-    total_silences = sum(len(detect_silence.__code__.co_varnames) for _ in [])  # avoid recount
     print(f"  キープ区間: {len(keep_tl_regions)}個")
     print(f"  カット: {total_cut}f ({total_cut/timebase:.1f}s)")
     print(f"  結果: {tl_duration/timebase:.1f}s → {total_kept/timebase:.1f}s "
           f"({total_cut/tl_duration*100:.1f}%削減)")
+
+    # ── fps正規化 ──
+    # VFR素材などでXML宣言fps（例: 29）が実素材fps（例: 29.998）とズレている場合、
+    # 出力シーケンスのrateを実素材に最も近い標準fps（timebase+ntsc）へ揃える。
+    # フレーム番号は実体の連番なので変えず、rate表記とtick(時間)換算だけを補正する。
+    normalize = not args.no_normalize_fps
+    target_tb, target_ntsc = tb, ntsc
+    do_normalize = False
+    if normalize and a1_real_fps and abs(a1_real_fps - timebase) > 0.01:
+        nearest = max(1, round(a1_real_fps))
+        candidates = [
+            (nearest, False, float(nearest)),          # 例: 30.0
+            (nearest, True, nearest * 1000.0 / 1001.0),  # 例: 29.97
+        ]
+        target_tb, target_ntsc, _ = min(
+            candidates, key=lambda c: abs(c[2] - a1_real_fps))
+        do_normalize = (target_tb != tb) or (target_ntsc != ntsc)
+
+    if do_normalize:
+        effective_fps = target_tb * 1000.0 / 1001.0 if target_ntsc else float(target_tb)
+        ticks_per_frame = int(TICKS_PER_SECOND / effective_fps)
+        print(f"  fps正規化: 宣言 {timebase:.4f}fps → 出力 "
+              f"{effective_fps:.4f}fps (timebase={target_tb}, ntsc={'TRUE' if target_ntsc else 'FALSE'})")
 
     # ── XML再構築 ──
     print(f"\n[4/4] XML再構築...")
@@ -392,6 +494,16 @@ def main():
                             clipindex_elem.text = str(target_sub_idx + 1)
 
             track_elem.append(new_clip)
+
+    # fps正規化: 全 <rate> ブロックの timebase/ntsc を書き換え
+    if do_normalize:
+        for rate_elem in root.iter('rate'):
+            tbe = rate_elem.find('timebase')
+            ne = rate_elem.find('ntsc')
+            if tbe is not None:
+                tbe.text = str(target_tb)
+            if ne is not None:
+                ne.text = 'TRUE' if target_ntsc else 'FALSE'
 
     # XML出力
     ET.indent(tree, space='\t')
