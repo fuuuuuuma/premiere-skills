@@ -64,10 +64,17 @@ for i, s in enumerate(starts):
 # 4) 等分ターゲット付近の無音中点へスナップ（候補が無ければ等分点で妥協）
 WINDOW = 60.0
 bounds = [0.0]
+bounds_fallback = []  # 無音候補なしで等分点になった境界（発話途中分割の恐れ）
 for i in range(1, n):
     target = duration * i / n
     cands = [m for m in mids if abs(m - target) <= WINDOW and m > bounds[-1] + 5]
-    split = min(cands, key=lambda m: abs(m - target)) if cands else target
+    if cands:
+        split = min(cands, key=lambda m: abs(m - target))
+    else:
+        split = target
+        bounds_fallback.append(i)
+        print(f"WARN: chunk境界{i} は±{WINDOW:.0f}s内に無音候補なし。"
+              f"等分点 {target:.1f}s で妥協（発話途中分割の恐れ・境界付近は目視推奨）")
     bounds.append(round(split, 3))
 bounds.append(duration)
 
@@ -103,6 +110,7 @@ manifest = {
     "overlap": OVERLAP,
     "silence_d": SILENCE_D,
     "bounds": bounds,
+    "bounds_fallback": bounds_fallback,
     "silence_count": len(mids),
     "chunks": chunks,
 }

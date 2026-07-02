@@ -80,14 +80,14 @@ def probe_media_fps_duration(path):
 
 
 def detect_silence_envelope(audio_file, start_sec, duration_sec,
-                            threshold_db=-50, min_silence=0.2,
+                            threshold_db=-45, min_silence=0.2,
                             sr=16000, win_ms=20):
     """RMSエンベロープの閾値交差で無音区間を検出（前後対称化の根本対策）。
 
     silencedetectは発話の『頭』(鋭い立ち上がり)は正確だが『終わり』(緩やかな減衰)を
     約1f遅れて落とすため、前後で残し量がズレる。これは検出方向ではなく減衰音の
     終端定義の曖昧さに由来する。そこで前後を同一基準＝1本の中央窓RMSエンベロープの
-    -50dB交差点で定義すると、対称パディングが定義上ぴったり前後同じ残し量になる。
+    閾値dB交差点で定義すると、対称パディングが定義上ぴったり前後同じ残し量になる。
 
     返り値は (start_sec, end_sec) のリスト（絶対時間・秒）。numpy必須。
     """
@@ -147,7 +147,7 @@ def main():
         help="出力ディレクトリ。指定時はこのディレクトリに '<basename>_カット済み.xml' を配置。"
              "推奨: $REPO_DIR/output/cut/",
     )
-    parser.add_argument("--threshold", type=float, default=-50,
+    parser.add_argument("--threshold", type=float, default=-45,
                         help="無音判定の閾値(dB)。小さい値ほど厳しく(=カット減)。ぶつぶつ喋りは -45〜-50 推奨")
     parser.add_argument("--min-silence", type=float, default=0.2,
                         help="無音と判定する最小秒数。大きくすると短い間(ま)を残す")
@@ -185,7 +185,18 @@ def main():
     print("\n[1/4] XML解析...")
     tree = ET.parse(input_xml)
     root = tree.getroot()
-    sequence = root.find('.//sequence')
+    # 複数 <sequence>（ネストシーケンス・bin内の別シーケンス等）がある場合は
+    # clipitem 総数が最大のものを編集対象に選ぶ（先頭固定だと意図しない
+    # シーケンスを加工する恐れがある。whisper_to_srt.py の best_seq と同方針）
+    sequences = root.findall('.//sequence')
+    if not sequences:
+        print("ERROR: XMLに<sequence>が見つかりません")
+        sys.exit(1)
+    sequence = max(sequences, key=lambda s: len(s.findall('.//clipitem')))
+    if len(sequences) > 1:
+        name = sequence.findtext('name') or sequence.get('id') or '?'
+        print(f"  WARNING: <sequence>が{len(sequences)}個あります。"
+              f"clipitem最多の '{name}' を編集対象に選択")
 
     rate_elem = sequence.find('.//rate')
     tb = int(rate_elem.find('timebase').text)
@@ -193,6 +204,11 @@ def main():
     timebase = tb * 1000 / 1001 if ntsc else tb
     ticks_per_frame = int(TICKS_PER_SECOND / timebase)
     min_silence_frames = max(1, int(round(MIN_SILENCE * timebase)))
+    if PADDING_FRAMES * 2 >= min_silence_frames:
+        print(f"WARNING: --padding({PADDING_FRAMES}f)×2 が --min-silence"
+              f"({MIN_SILENCE}s={min_silence_frames}f) 以上のため、検出した無音が"
+              f"すべてパディングに食われて1フレームもカットされません。"
+              f"padding を min-silence の半分未満にしてください")
 
     seq_duration = int(sequence.find('duration').text)
     print(f"  タイムベース: {timebase:.4f}fps")
@@ -265,6 +281,7 @@ def main():
 
     all_silence_tl_frames = []
     a1_real_fps = None  # 正規化用：A1メイン素材の実fps
+    probe_cache = {}    # 同一ファイルの複数クリップで ffprobe を繰り返さない
 
     for ci, a1_clip in enumerate(a1_track['clips']):
         audio_file = a1_clip['filepath']
@@ -278,7 +295,9 @@ def main():
         # 実音声 T 秒は timeline フレーム T*timebase に置かれる。動画の実fps(例: 29.998)は
         # 音声配置に無関係。ここで実fpsを使うと毎秒(timebase-実fps)分ずれ、後半ほど累積ドリフトする。
         # 実fpsは末尾クランプの判定とfps正規化の判断にのみ使う。
-        real_fps, media_dur = probe_media_fps_duration(audio_file)
+        if audio_file not in probe_cache:
+            probe_cache[audio_file] = probe_media_fps_duration(audio_file)
+        real_fps, media_dur = probe_cache[audio_file]
         if a1_real_fps is None and real_fps:
             a1_real_fps = real_fps
         in_sec = a1_clip['in_frame'] / timebase
@@ -294,7 +313,7 @@ def main():
             print(f"    実fps={real_fps:.4f}（宣言timebase={timebase:.4f}）→ 換算は宣言timebase基準（音声は実時間配置）")
         print(f"    解析範囲: {in_sec:.2f}s ～ {in_sec + dur_sec:.2f}s ({dur_sec:.1f}s)")
 
-        # 前後を同一基準で検出（中央窓RMSエンベロープの-50dB交差）。
+        # 前後を同一基準で検出（中央窓RMSエンベロープの閾値dB交差）。
         # silencedetectは減衰する発話末尾の検出が約1f遅れ前後非対称になるため使わない。
         silences = detect_silence_envelope(
             audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
@@ -475,23 +494,28 @@ def main():
                 else:
                     file_defined.add(fid)
 
-            # link参照更新
+            # link参照更新（対応クリップが見つからない link は要素ごと除去する。
+            # 削除済みclipitem IDを残すとPremiere読み込み時にリンク解決エラーや
+            # 誤バインドを起こす。mic_gate.py の全除去方針と同じ扱い）
             for link in new_clip.findall('link'):
                 linkref = link.find('linkclipref')
-                if linkref is not None and linkref.text in old_id_to_track:
-                    other_track_idx = old_id_to_track[linkref.text]
-                    # 同じsub_idxの新クリップにリンク（同じタイムライン位置の対応クリップ）
-                    # ただし他トラックのsub_idx数が異なる可能性があるので、
-                    # タイムライン位置で対応するクリップを探す
-                    target_sub_idx = find_matching_sub_idx(
-                        new_clips_per_track[other_track_idx],
-                        nc['new_tl_start'], nc['new_tl_end']
-                    )
-                    if target_sub_idx is not None:
-                        linkref.text = new_id_map[(other_track_idx, target_sub_idx)]
-                        clipindex_elem = link.find('clipindex')
-                        if clipindex_elem is not None:
-                            clipindex_elem.text = str(target_sub_idx + 1)
+                if linkref is None or linkref.text not in old_id_to_track:
+                    new_clip.remove(link)
+                    continue
+                other_track_idx = old_id_to_track[linkref.text]
+                # 同じタイムライン位置の対応クリップを探す
+                # （他トラックのsub_idx数が異なる可能性があるため位置で対応付ける）
+                target_sub_idx = find_matching_sub_idx(
+                    new_clips_per_track[other_track_idx],
+                    nc['new_tl_start'], nc['new_tl_end']
+                )
+                if target_sub_idx is None:
+                    new_clip.remove(link)
+                    continue
+                linkref.text = new_id_map[(other_track_idx, target_sub_idx)]
+                clipindex_elem = link.find('clipindex')
+                if clipindex_elem is not None:
+                    clipindex_elem.text = str(target_sub_idx + 1)
 
             track_elem.append(new_clip)
 

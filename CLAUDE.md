@@ -1,6 +1,6 @@
 # premiere-skills プロジェクトローカル規約
 
-`~/ClaudeCode/CLAUDE.md`（グローバルルール）に加えて、このプロジェクト固有の規約を記載する。
+上位の CLAUDE.md（グローバルルール）に加えて、このプロジェクト固有の規約を記載する。
 
 ## プロジェクト目的
 
@@ -21,9 +21,14 @@ Premiere Pro ベースの動画編集ワークフローを Claude Code スキル
 
 ### 2. スキルのステップを省略しない
 
-`commands/srt.md` の全ステップは必須。特に Step 5（LLM 改行テキスト生成）は意味区切りルールと固有名詞辞書を適用しながら慎重に行う。時短のために省略してはいけない。
+`commands/srt.md` の全ステップは必須。特に Step 5（LLM 改行テキスト生成）は
+`references/srt_runtime_rules.md`（実行時ルール正典）を読み、全ルールを適用しながら慎重に行う。
+時短のために省略してはいけない。
 
-**CORRECTIONS 辞書との同期必須**: lines.txt で固有名詞を正規化する場合、`whisper_to_srt.py` の CORRECTIONS 辞書にも必ず同じマッピングを追加してから Step 6 を実行する。これを怠ると累積タイムズレが発生する。
+**CORRECTIONS 辞書の扱い（v6 で緩和）**: 時刻割当は difflib 全体アライメントになったため、
+lines.txt 側の固有名詞修正が辞書に無くても累積タイムズレは発生しない。ただし
+**チャンネル内で再登場する固有名詞**は CORRECTIONS 辞書と `memory/telop_channel_patterns.md`
+に追記する（次回以降の転写品質向上のため）。一回限りの文脈誤認識は辞書に入れない。
 
 ### 3. 出力は必ず `output/` 配下に配置
 
@@ -48,10 +53,3 @@ Premiere Pro ベースの動画編集ワークフローを Claude Code スキル
 |---|---|---|
 | `memory/feedback_srt_grouping_rules.md` | SRT 切り分けの絶対ルール・失敗例・正解例 | ユーザー指摘時、新しい失敗パターン発見時 |
 | `memory/telop_channel_patterns.md` | [CHANNEL]ch 固有の固有名詞辞書・スタイル | 新しい固有名詞・表記揺れ発見時 |
-
-## 依存関係の前提
-
-- Python 3.9+（`/usr/bin/python3` または `python3`）
-- `faster-whisper`（`pip3 install --user faster-whisper`）
-- `ffmpeg`（`brew install ffmpeg`）
-- Claude Code CLI

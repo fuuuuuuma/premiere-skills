@@ -1,24 +1,30 @@
 ---
-description: WAV音声＋Premiere Pro XML からカット点同期SRT字幕を自動生成する。日本語トーク動画のテロップ用。Whisper→LLM意味区切り改行→SRT の3ステップ構成（v5・スピード重視）。
+description: WAV音声＋Premiere Pro XML からカット点同期SRT字幕を自動生成する。日本語トーク動画のテロップ用。並列Whisper→LLM意味区切り改行→difflib全体アライメントSRT の3ステップ構成（v6・速度と精度の両立）。
 ---
 
-# WAV + XML → SRT 字幕自動生成 (v5)
+# WAV + XML → SRT 字幕自動生成 (v6)
 
 ## 設計原則
 
 ```
-[機械]   Whisper(large-v3, beam=1, VAD) → segments.json        [約7分]
-[LLM]    意味の区切りで改行したテキストを .txt に出力         [約3分]
-[機械]   --from-text で改行テキスト + 単語タイミング → SRT   [約0秒]
-─────────────────────────────────────────────────────────
-合計: 約10〜15分（実測: 28分音声で13分34秒）
+[機械]   transcribe_parallel.py: 3分割並列Whisper(large-v3) → segments.json + fulltext.txt  [約3〜4分]
+[LLM]    意味の区切りで改行したテキストを .txt に出力（ルール正典1ファイル参照）        [約3分]
+[機械]   --from-text: difflib全体アライメントで時刻割当 → SRT + QAレポート               [約10秒]
+─────────────────────────────────────────────────
+合計: 約6〜8分（28分音声想定。v5 実測13分34秒 → 約半分）
 ```
+
+- **時刻割当は difflib 全体アライメント**（v6）。lines.txt 側の固有名詞修正が CORRECTIONS 辞書に
+  未登録でも時刻はズレない（v5 の「辞書同期必須」制約は廃止。辞書追加は転写品質向上のための推奨事項）
+- **転写は3プロセス並列**（LLM/エージェント不使用の機械工程。トークン消費ゼロ）。
+  チャンク境界の欠落は overlap 転写からの自動復元で対策済み
+- **品質チェックはスクリプト内蔵**（Step 6 の出力に QA レポートが含まれる。LLM が SRT を読み直さない）
 
 ## 重要ルール
 
 - **意味境界優先**: 文字数（5〜25字目安）は縛りすぎない
 - **自律動作**: ユーザー確認不要。生成したら即 SRT 化する
-- **固有名詞**: `memory/telop_channel_patterns.md` の辞書を参照して修正
+- **改行・固有名詞・削除保持の全ルールは `references/srt_runtime_rules.md` が正典**
 
 ## 使い方
 
@@ -32,18 +38,20 @@ XML は省略可能（ただし XML ありの方が時刻精度が高い）。
 
 ## 実行手順
 
-### Step 0: メモリ読み込み（必須）
+### Step 0: ルール読み込み（必須・1ファイルだけ）
 
-絶対パスで Read:
+絶対パスで Read: `<このリポジトリのルート>/references/srt_runtime_rules.md`
 
-1. `~/ClaudeCode/projects/常時運用/premiere-skills/memory/feedback_srt_grouping_rules.md`
-2. `~/ClaudeCode/projects/常時運用/premiere-skills/memory/telop_channel_patterns.md`
+（過去の memory 2ファイルの読込は不要になった。全ディレクティブは正典に蒸留済み。
+新しい失敗パターンに出会ったら memory に経緯を追記し、正典にルールを反映する）
 
 ### Step 1: ファイル存在確認 + 出力ディレクトリ
 
 ```bash
 VIDEO_BASENAME="$(basename '<wav>' .wav)"
-OUTPUT_DIR="$HOME/ClaudeCode/projects/常時運用/premiere-skills/output/srt/$VIDEO_BASENAME"
+SCRIPT="$HOME/.claude/scripts/whisper_to_srt.py"
+REPO="$(cd "$(dirname "$(realpath "$SCRIPT")")/.." && pwd)"
+OUTPUT_DIR="$REPO/output/srt/$VIDEO_BASENAME"
 mkdir -p "$OUTPUT_DIR"
 ```
 
@@ -51,15 +59,21 @@ mkdir -p "$OUTPUT_DIR"
 
 `$OUTPUT_DIR/$VIDEO_BASENAME.segments.json` があれば Step 4 へ直行。なければ Step 3。
 
-### Step 3: Whisper 転写（高速モード）
+### Step 3: 並列 Whisper 転写（機械工程・トークン消費ゼロ）
 
 ```bash
-python3 "$HOME/.claude/scripts/whisper_to_srt.py" "<wav>" --xml "<xml>" --output-dir "$OUTPUT_DIR"
+python3 "$REPO/scripts/transcribe_parallel.py" "<wav>" --jobs 3
 ```
 
 **Bash タイムアウト: 600000ms（10分）必須**
 
-### Step 4: 全文テキスト抽出
+- segments.json / fulltext.txt / 16k mono wav キャッシュが `$OUTPUT_DIR` に生成される
+- 短い音声では並列数が自動で絞られる。`⚠ 未解消の空白区間` が出たらその時刻帯を Step 7 で報告する
+
+### Step 4: 全文テキスト確認
+
+Step 3 が `$VIDEO_BASENAME.fulltext.txt` を出力済み。キャッシュ直行（Step 2→4）で
+fulltext.txt が無い場合のみ生成する:
 
 ```bash
 python3 -c "
@@ -73,39 +87,33 @@ print(''.join(s.get('text', '') for s in data))
 ### Step 5: 意味区切り改行テキストを生成（LLM が直接ファイル書き込み）
 
 1. `fulltext.txt` を Read する
-2. 全文を意味の区切りで改行する（各行が 1 テロップ）
-3. 固有名詞を `memory/telop_channel_patterns.md` の辞書に従って修正
-4. `$OUTPUT_DIR/$VIDEO_BASENAME.lines.txt` に Write
+2. **`references/srt_runtime_rules.md` の全ルール**（絶対禁止8項・積極分割・削除/保持・
+   固有名詞表記・半角スペース3類型・句読点禁止）に従い、全文を意味の区切りで改行する（各行が 1 テロップ）
+3. `$OUTPUT_DIR/$VIDEO_BASENAME.lines.txt` に Write
 
-**改行のルール（必須）**:
+**v6 の固有名詞ルール**: 残存する誤認識は文脈で正規表記に修正してよい（全体アライメントが
+吸収するので時刻はズレない）。**チャンネル内で再登場する固有名詞**を新たに見つけたら、
+`whisper_to_srt.py` の CORRECTIONS 辞書と `memory/telop_channel_patterns.md` に追記する
+（次回以降の転写品質向上のため。今回の SRT 生成には必須ではない）。
 
-- **意味の区切りで切る**（文字数より意味優先、5〜25字目安）
-- **複合動詞句は分断しない**: 「〜ている」「〜ていく」「〜てくる」「〜てみる」「〜ておく」「〜てしまう」等は 1 行
-- **副詞句は後続動詞と同じ行**: 「徹底的に」「本当に」「しっかりと」は次の行の先頭
-- **話題転換で切る**: 説明→CTA、概念→具体例、肯定→疑問
-- **「〜おり/ており」「〜ですけども」「〜なんですけど」で切る**
-- **文頭禁止パターン**: 「ます」「まし」「ない」「とき」「こと」等で始めない（前の行に結合）
-- **フィラー**: 「こう」「ちょっと」は文脈判断で残す（全削除禁止）
-- **空行は段落区切り**（SRT には反映されない）
-- **句読点（、。）は使わない**
-
-**⚠️ lines.txt に書く固有名詞は CORRECTIONS 辞書登録済みのもののみ**
-LLM が Whisper のカタカナを英語に修正する場合、スクリプトの CORRECTIONS 辞書にも同じマッピングが必要。未登録のまま lines.txt だけ変えると、アンカー検索の誤マッチ＋時刻ズレが発生する。修正内容が辞書にない場合は Whisper 表記のまま残す（または辞書に追加してから修正する）。
-
-### Step 6: SRT 生成
+### Step 6: SRT 生成（QA レポート内蔵）
 
 ```bash
-python3 "$HOME/.claude/scripts/whisper_to_srt.py" \
+python3 "$SCRIPT" \
   --from-text "$OUTPUT_DIR/$VIDEO_BASENAME.lines.txt" \
   --segments "$OUTPUT_DIR/$VIDEO_BASENAME.segments.json" \
   --xml "<xml>" \
   -o "$OUTPUT_DIR/$VIDEO_BASENAME.srt"
 ```
 
+標準出力の末尾に「SRT 品質チェック（QA）」レポートが出る。
+**25字超・文頭NG候補が指摘されたら、該当行だけ lines.txt を修正して Step 6 を再実行**
+（QA が「✅ 要修正なし」になるか、意味的にこれ以上割れないと判断するまで）。
+
 ### Step 7: 完了報告
 
 1. SRT の絶対パス
-2. 統計表（エントリ数・平均文字数・25字超件数・4字未満件数）
+2. **Step 6 標準出力の QA レポートをそのまま転記**（SRT を Read し直して再集計しない）
 3. 「Premiere Pro にインポートできます」
 
 ## ファイル管理
@@ -115,13 +123,15 @@ python3 "$HOME/.claude/scripts/whisper_to_srt.py" \
 
 **残す（次回高速起動用）**:
 - `$VIDEO_BASENAME.segments.json`（Whisperキャッシュ）
-- `$VIDEO_BASENAME.words.json`
+- `$VIDEO_BASENAME.wav`（16k mono 変換キャッシュ）
 - `$VIDEO_BASENAME.lines.txt`（改行テキスト本体）
 - `$VIDEO_BASENAME.srt`（成果物）
 
+（chunk 中間ファイルは transcribe_parallel.py が自動削除する）
+
 ## リファレンス
 
-- **改行・品質ルール**: `references/srt_rules.md`
-- **品質チェックコード**: `references/srt_quality_check.md`
-- **過去の失敗例・正解例**: `memory/feedback_srt_grouping_rules.md`
-- **チャンネル固有名詞辞書**: `memory/telop_channel_patterns.md`
+- **実行時ルール正典（Step 5 で必読）**: `references/srt_runtime_rules.md`
+- ルールの原典・過去の失敗例と経緯: `memory/feedback_srt_grouping_rules.md`
+- チャンネル固有名詞辞書（完全版）: `memory/telop_channel_patterns.md`
+- 品質チェック: `--qa <srt>` フラグでいつでも単体実行可（references/srt_quality_check.md は旧手順）

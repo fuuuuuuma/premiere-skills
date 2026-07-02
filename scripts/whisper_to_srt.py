@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import difflib
 import json
 import os
 import platform
@@ -74,9 +75,9 @@ CORRECTIONS: dict[str, str] = {
     "ジェンスパーク": "Genspark",  # Genspark AIエージェント
     "コデックス": "Codex",         # ChatGPT Codex
     "コレックス": "Codex",         # ChatGPT Codex（別誤変換）
+    "コーデックス": "Codex",       # ChatGPT Codex（長音符付き誤変換・テスト動画で頻出）
     "グロック": "Grok",            # ★ xAI Grok 11回/本
-    # ── 無料AIツール（No.769で追加） ──
-    "フロー": "Flow",              # ★ Flow（無料AI） 12回/本
+    # 「フロー」→Flow は REGEX_CORRECTIONS へ移動（ワークフロー等の複合語を保護）
     # ── 音楽生成AI ──
     "エースミュージック": "Ace Music",  # ★ Ace Music（ローカル音楽生成） 13回/本
     "群れ替えAI": "Mureka AI",    # ★ MurekaAI の誤変換（3回/本）
@@ -102,8 +103,9 @@ CORRECTIONS: dict[str, str] = {
     "クロード": "Claude",
     "ジェミニ": "Gemini",
     "マナス": "Manus",
-    "ロバート": "Lovart",
-    "カーソル": "Cursor",
+    # 「ロバート」→Lovart は文脈依存（人名Robertを破壊）のため辞書から除外。
+    # LLM が lines.txt で文脈修正する（v6 は全体アライメントなので時刻はズレない）
+    # 「カーソル」→Cursor は REGEX_CORRECTIONS へ移動（マウスカーソル等を保護）
     # ── チャンネル固有名詞 ──
     # 2026-04-18: N1 はチャンネル表記「[COMPANY]」に統一
     "エヌワン": "[COMPANY]",
@@ -116,6 +118,7 @@ CORRECTIONS: dict[str, str] = {
     "AICクラブ": "[CHANNEL]",       # ★ 別パターン
     # ── [COMPANY]関連の追加誤認識（2026-04-18） ──
     "NHAI副業大学": "[COMPANY]大学",
+    "NH AI副業大学": "[COMPANY]大学",
     "NHがやってる": "[COMPANY]がやってる",
     "n 1": "[COMPANY]",
     # ── 動画生成・ツール追加（2026-04-18） ──
@@ -141,7 +144,6 @@ CORRECTIONS: dict[str, str] = {
     # ── Whisperの一般的な誤変換 ──
     "該注": "外注",
     "v側近性": "即金性",
-    "受託": "受託",
     # ── No.801 学習結果（2026-04-12、音声生成AI徹底比較） ──
     # UIラベル・ボタン名（英語で統一）
     "ジェネレーションコンプリーティットサクセスフリー": "Generation completed successfully",
@@ -177,24 +179,38 @@ CORRECTIONS: dict[str, str] = {
     # ── No.822 学習結果（2026-04-25、中国の動画生成AIがレベチすぎる） ──
     "ソラ": "Sora",
     "ベオー3.1": "Veo 3.1",
+    "VEOS 3.1": "Veo 3.1",           # WhisperがVeo 3.1を英字誤認識
     "ベオスリー": "Veo 3",
     "ランメイ": "Runway",
     "ランウェイ": "Runway",
+    "LANWARE": "Runway",              # WhisperがRunwayを英字誤認識
     "ノーラン": "NoLang",
+    "NORAN": "NoLang",                # WhisperがNoLangを英字誤認識
     "KlingAI": "Kling AI",
     "ハイルオAI": "HailuoAI",
     "ハイルオ": "HailuoAI",
+    # 「ハイル」→HailuoAI は REGEX_CORRECTIONS へ移動（カタカナ複合語を保護）
     "ラブアート": "Lovart",
     "1AI": "Wan",
+    "ワンAI": "Wan",                  # Wan（アリババ動画生成AI）のカタカナ誤認識
     "Seedance2.0": "Seedance 2.0",
     "SEA DANCE 2.0": "Seedance 2.0",
     "Cダンス2.0": "Seedance 2.0",
+    "c ダンス2.0": "Seedance 2.0",    # 小文字＋スペースパターン
+    "c ダンス": "Seedance",           # No.829: "c ダンス を超える" パターン（2.0 なし）
+    # ── No.829 漫画NOW公式コラボ 新出誤認識（2026-05-03） ──
+    "漫画ナウ": "漫画NOW",            # 漫画NOWの誤認識（カタカナ）
+    "マンガナウ": "漫画NOW",          # 漫画NOWの別誤認識（カタカナ）
+    "ハッピー オース": "HappyHorse",  # HappyHorse（動画生成モデル）の誤認識
+    "GBTメージ": "GPT Image",         # GPT Imageの誤認識
     "キャップカット": "CapCut",
     "トップビューAI": "TopView AI",
     "ドリーミナ": "Dreamina",
     "ハッピーホース1.0": "HappyHorse 1.0",
     "ハッピーホース": "HappyHorse",
-    "岡山": "奥山",
+    "AI収益カラボ": "[CHANNEL]",   # テスト動画で発生した短縮誤認識
+    "AI主役カラーボ": "[CHANNEL]", # テスト動画で発生した別パターン
+    # 「岡山」→奥山 は REGEX_CORRECTIONS へ移動（岡山県/岡山市を保護）
     "アーティフィカルアナリシスビデオアレナ": "Artificial Analysis Video Arena",
     "アーティフィカルアナリシス": "Artificial Analysis",
     "ビデュ": "Vidu",
@@ -202,14 +218,40 @@ CORRECTIONS: dict[str, str] = {
     "インスタグラム": "Instagram",
     "公式ライン": "公式LINE",
     "LINE登録者限定に": "LINE登録者限定で",
+    # ── No.17 ClaudeCode×動画編集 新出誤認識（2026-04-29） ──
+    "AI修理科ラボ": "[CHANNEL]",      # チャンネル名（「収益化」→「修理科」誤認識）
+    "AI修理コラボ": "[CHANNEL]",      # チャンネル名（別パターン）
+    "クロートコード": "ClaudeCode",       # ClaudeCode誤認識（ロードではなくロート）
+    "SONET": "Sonnet",                    # Sonnet（モデル名、シングルN誤認識）
+    # ── No.20 LINE登録マニュアル新出誤認識（2026-05-05） ──
+    "JMINI": "Gemini",                    # Gemini（Whisperが「JMINI」と誤認識）
+    "qr コード": "QRコード",              # QRコード（小文字+スペース表記を正規化）
+    " ok ": " OK ",                       # OK（小文字表記を正規化）
+    # ── ERABERU AI×動画編集 新出（2026-07-02） ──
+    "フェイブル5": "Fable 5",             # Claude新モデル名（半角スペース付き正規表記）
+    "フェイブル": "Fable",
+    "オープンAI": "OpenAI",
+    "AIかける動画編集": "AI×動画編集",    # 企画名の正規表記（「かける」=×）
 }
+
+# 文脈ガード付き置換（str.replace の全置換だと「ワークフロー→ワークFlow」のような
+# 複合語破壊が起きるエントリ。前後がカタカナ/長音でない単独出現のみ置換する）
+_KATA = r"[ァ-ヺー]"
+REGEX_CORRECTIONS: list[tuple[re.Pattern, str]] = [
+    (re.compile(rf"(?<!{_KATA})フロー(?!{_KATA})"), "Flow"),      # ワークフロー/フローチャートは保護
+    (re.compile(rf"(?<!{_KATA})カーソル(?!{_KATA})"), "Cursor"),  # マウスカーソルは保護
+    (re.compile(rf"(?<!{_KATA})ハイル(?!{_KATA})"), "HailuoAI"),
+    (re.compile(r"岡山(?![県市駅])"), "奥山"),                     # 地名（岡山県/岡山市/岡山駅）は保護
+]
 
 # フィラー削除パターン（正規表現）
 # 否定先読み (?!...) で複合語の誤削除を防止
 FILLER_PATTERNS: list[str] = [
     # ── 明確なフィラー（誤検出リスク低） ──
-    r'まあ',                         # ほぼ常にフィラー
-    r'確かに',                        # 相槌
+    r'(?<!まあ)まあ(?!まあ)',          # 「まあまあ」（程度表現）は保護
+    # 「確かに」は削除しない: No.801 完成版で「確かに声は似てる」が残っており、
+    # CORRECTIONS の助詞補完エントリとも矛盾するため。相槌の単独「確かに」は
+    # LLM が lines.txt 生成時に文脈判断で削る
     r'え[ーえっ]*と',                  # えっと、ええと、えーと
     # ── 複合語保護付きフィラー ──
     # 「こう」「ちょっと」は No.801 学習で全削除禁止。完成版 V4 で残されているケースが多い
@@ -230,11 +272,13 @@ def snap_to_frame(seconds: float, fps: float = FPS) -> float:
 
 
 def to_srt_time(seconds: float, fps: float = FPS) -> str:
+    # 総ミリ秒を整数で確定してから分解する。(t % 1) * 1000 の丸めでは
+    # ms=1000 になる境界があり "00:00:01,1000" のような不正表記が出うる。
     t = snap_to_frame(seconds, fps)
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = int(t % 60)
-    ms = round((t % 1) * 1000)
+    ms_total = max(0, int(round(t * 1000)))
+    h, rem = divmod(ms_total, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -266,6 +310,8 @@ def _convert_kanji_numbers(text: str) -> str:
 def apply_corrections(text: str) -> str:
     for wrong in sorted(CORRECTIONS, key=len, reverse=True):
         text = text.replace(wrong, CORRECTIONS[wrong])
+    for pattern, repl in REGEX_CORRECTIONS:
+        text = pattern.sub(repl, text)
     text = _convert_kanji_numbers(text)
     text = _add_number_commas(text)
     return text
@@ -908,7 +954,102 @@ def emit_candidates(
     print(f"     違和感を検出・修正してから grouped.json を Write してください。")
 
 
-# ── Phase 2b: --from-text (改行テキスト → SRT 直接生成・v5) ───────────────────
+# ── 品質チェック（QA） ────────────────────────────────────────────────────────
+
+# 文頭に来てはいけないパターン（QA 用・カタカナ破片ルールは誤検出が多いため除外）
+QA_FORBIDDEN_HEAD_RE = re.compile(
+    r'^('
+    r'[をにがはのとやもねよぞ][^0-9A-Za-zぁ-ゖ一-龥ァ-ヺー]|'
+    r'ます$|まし[た]|ません|でした|きます|きました|'
+    r'ない$|なくて|なった|'
+    r'ている|ていく|てくる|てみる|ておく|てしまう|てほしい|てくれ|てあげ|'
+    r'てもらう|ていただ|ており|ておき|ていた|ていま|てくださ|'
+    r'という$|として$|について|によって|にとって|'
+    r'ため[にの]|とき[にの]|こと[にをがはで]|もの[をがはで]'
+    r')'
+)
+
+
+def qa_report(
+    entries: list[tuple[float, float, str]],
+    srt_path: str | None = None,
+) -> int:
+    """SRT の品質チェックを行い、レポートを標準出力する。
+
+    skill 側（srt.md Step 7）はこの出力をそのまま報告に転記する。
+    LLM が SRT を Read し直して集計する必要はない（トークン節約）。
+    戻り値は要修正件数（25字超 + 文頭NG + 0ms表示 + 重複）。
+    """
+    texts = [t for _, _, t in entries]
+    lens = [len(t) for t in texts]
+    durs = [e - s for s, e, _ in entries]
+    over25 = [(i + 1, t) for i, t in enumerate(texts) if len(t) > 25]
+    under4 = [(i + 1, t) for i, t in enumerate(texts) if len(t) < 4]
+    head_ng = [(i + 1, t) for i, t in enumerate(texts) if QA_FORBIDDEN_HEAD_RE.match(t)]
+    zero_dur = sum(1 for d in durs if d <= 0)
+    overlaps = 0
+    gaps500 = 0
+    max_gap = 0.0
+    max_gap_at = 0.0
+    for i in range(len(entries) - 1):
+        g = entries[i + 1][0] - entries[i][1]
+        if g < -0.001:
+            overlaps += 1
+        if g > 0.5:
+            gaps500 += 1
+            if g > max_gap:
+                max_gap = g
+                max_gap_at = entries[i][1]
+
+    print("\n── SRT 品質チェック（QA） ──")
+    print(f"  総エントリ: {len(entries)}")
+    if lens and durs:
+        print(f"  平均文字数: {sum(lens) / len(lens):.1f} / 中央値: {sorted(lens)[len(lens) // 2]}")
+        print(f"  表示時間平均: {sum(durs) / len(durs):.2f}s / 文字/秒: {sum(lens) / max(sum(durs), 0.01):.1f}")
+    pct25 = len(over25) / max(len(entries), 1) * 100
+    print(f"  25字超: {len(over25)}件 ({pct25:.1f}% / 目標1%未満)")
+    for idx, t in over25[:10]:
+        print(f"    #{idx}: {t}")
+    print(f"  4字未満: {len(under4)}件")
+    print(f"  文頭NG候補（要確認）: {len(head_ng)}件")
+    for idx, t in head_ng[:10]:
+        print(f"    #{idx}: {t}")
+    print(f"  0ms表示: {zero_dur}件 / 時間重複: {overlaps}件")
+    tail = f"（最大 {max_gap:.1f}s @ {max_gap_at:.1f}s 付近）" if gaps500 else ""
+    print(f"  0.5s超ギャップ: {gaps500}件{tail}")
+    if srt_path:
+        raw = open(srt_path, "rb").read()
+        bom = "OK" if raw[:3] == b"\xef\xbb\xbf" else "NG"
+        crlf = "OK" if b"\r\n" in raw else "NG"
+        print(f"  UTF-8 BOM: {bom} / CRLF: {crlf}")
+    issues = len(over25) + len(head_ng) + zero_dur + overlaps
+    if issues == 0:
+        print("  ✅ 要修正なし")
+    else:
+        print(f"  ⚠ 要修正候補 {issues} 件（25字超・文頭NGは lines.txt を直して再実行）")
+    return issues
+
+
+def _parse_srt_file(path: str) -> list[tuple[float, float, str]]:
+    """既存 SRT を (start, end, text) のリストに読み込む（--qa 用）。"""
+    with open(path, encoding="utf-8-sig") as f:
+        content = f.read()
+    entries: list[tuple[float, float, str]] = []
+
+    def _pt(t: str) -> float:
+        t = t.strip().replace(",", ".")
+        h, m, s = t.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    for block in content.strip().split("\n\n"):
+        lines_b = [ln for ln in block.strip().splitlines() if ln.strip()]
+        if len(lines_b) >= 3 and "-->" in lines_b[1]:
+            a, b = lines_b[1].split("-->")
+            entries.append((_pt(a), _pt(b), "\n".join(lines_b[2:])))
+    return entries
+
+
+# ── Phase 2b: --from-text (改行テキスト → SRT 直接生成・v6) ───────────────────
 
 
 def _normalize_for_match(s: str) -> str:
@@ -923,11 +1064,17 @@ def assemble_from_text(
     fps: float = FPS,
     xml_path: str | None = None,
 ) -> None:
-    """改行テキスト + segments.json から SRT を直接生成する（v5 のメイン経路）。
+    """改行テキスト + segments.json から SRT を直接生成する（v6 のメイン経路）。
 
-    各行を 1 テロップとし、時刻は Whisper 単語タイミングの累積文字数から割り当てる。
-    固有名詞修正（apply_corrections）は Whisper 側・テキスト側の両方に適用してから
-    マッチするので、Renoise / ClaudeCode など表記揺れは吸収できる。
+    各行を 1 テロップとし、行連結文字列 ↔ Whisper 単語連結文字列を
+    difflib.SequenceMatcher で全体アライメントして時刻を割り当てる。
+
+    v5 の局所アンカー方式（行頭6字を累積位置±60で前方検索）は、繰り返し語への
+    吸着・辞書非同期の累積文字数ズレ・逆戻り誤マッチで4種のバグを起こした
+    （memory/feedback_srt_grouping_rules.md 参照）。全体最適のアライメントは
+    前方ラチェットが原理的に起きず、lines.txt 側の固有名詞修正が CORRECTIONS
+    辞書に未登録でも局所の不一致として吸収される（/srt-fast assemble で実証済み・
+    /srt との時刻差 median ±0.00s）。
     """
     with open(segments_path, encoding="utf-8") as f:
         seg_list = json.load(f)
@@ -1008,72 +1155,77 @@ def assemble_from_text(
 
     # 改行テキストを行に分割（空行は段落区切りとして無視）
     lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
+    line_display = [apply_corrections(ln) for ln in lines]
+    line_norm = [_normalize_for_match(ld) for ld in line_display]
 
+    # ── 行→時刻: difflib 全体アライメント（v6） ──
+    # 各行の [行連結内開始, 終了) スパン
+    spans: list[tuple[int, int]] = []
+    acc = 0
+    for n_ in line_norm:
+        spans.append((acc, acc + len(n_)))
+        acc += len(n_)
+    line_cat = "".join(line_norm)
+
+    # 行連結位置 → word連結位置 の単調写像（一致ブロック端点で区分線形補間）
+    sm = difflib.SequenceMatcher(None, line_cat, whisper_norm_text, autojunk=False)
+    pts: list[tuple[int, int]] = [(0, 0)]
+    matched_chars = 0
+    for a, b, size in sm.get_matching_blocks():
+        if size <= 0:
+            continue
+        matched_chars += size
+        pts.append((a, b))
+        pts.append((a + size, b + size))
+    pts.append((len(line_cat), total_chars))
+    pts = sorted(set(pts))
+    mono: list[tuple[int, int]] = []
+    last_w = -1
+    for lc, wpos in pts:
+        if wpos >= last_w:
+            mono.append((lc, wpos))
+            last_w = wpos
+    mono_lc = [p[0] for p in mono]
+
+    def map_pos(p: int) -> float:
+        """行連結位置 p を word連結位置へ（区分線形）。"""
+        i = bisect.bisect_right(mono_lc, p) - 1
+        i = max(0, min(i, len(mono) - 1))
+        lc0, w0 = mono[i]
+        if i + 1 < len(mono):
+            lc1, w1 = mono[i + 1]
+        else:
+            return float(w0)
+        if lc1 == lc0:
+            return float(w0)
+        return w0 + (w1 - w0) * (p - lc0) / (lc1 - lc0)
+
+    # 各行に時刻を割り当て（start 単調・start<end を保証）
     entries: list[tuple[float, float, str]] = []
-    pos = 0  # char_to_word 上の現在位置（lines.txt 累積文字数 = Whisper 文字位置の推定値）
-    last_end_time = words[0]["start"]
-    tail_count = 0
-    anchored = 0
-    drift_sum = 0
-    TAIL_DUR_S = 1.0  # 末尾で単語切れした行に付与する暫定表示秒数
-    SEARCH_RADIUS = 60   # 累積文字位置 ± この範囲内で行頭の prefix を探す
-    PROBE_LEN = 6        # 探索に使う行頭文字数
-
-    min_pos = 0  # アンカー検索の下限（前エントリの終端を下回らない）
-
-    def _local_anchor(line_norm: str, expected_pos: int) -> int:
-        """行頭 prefix を expected_pos 周辺で探し、ヒットしたらその位置を返す。
-        ヒットしない場合は -1。短い行（< PROBE_LEN）はアンカー検索しない。
-        lo は min_pos 以上に制限し、過去位置への逆戻りによる誤マッチを防ぐ。
-        """
-        if len(line_norm) < PROBE_LEN:
-            return -1
-        probe = line_norm[:PROBE_LEN]
-        lo = max(min_pos, expected_pos - SEARCH_RADIUS)
-        hi = min(total_chars, expected_pos + SEARCH_RADIUS + len(probe))
-        idx = whisper_norm_text.find(probe, lo, hi)
-        return idx
-
-    for line in lines:
-        line_display = apply_corrections(line)
-        line_norm = _normalize_for_match(line_display)
-        line_len = len(line_norm)
-        if line_len == 0:
+    prev_start = words[0]["start"]
+    for (s_lc, e_lc), disp, nrm in zip(spans, line_display, line_norm):
+        if not nrm or not disp:
             continue
+        a0 = map_pos(s_lc)
+        a1 = map_pos(e_lc)
+        start_char = max(0, min(int(round(a0)), total_chars - 1))
+        end_char = max(start_char, min(int(round(a1)) - 1, total_chars - 1))
+        start_time = words[char_to_word[start_char]]["start"]
+        end_time = words[char_to_word[end_char]]["end"]
+        if start_time < prev_start:
+            start_time = prev_start
+        if end_time <= start_time:
+            end_time = start_time + 0.5
+        entries.append((start_time, end_time, disp))
+        prev_start = start_time
 
-        if pos >= total_chars:
-            start_time = last_end_time
-            end_time = last_end_time + TAIL_DUR_S
-            entries.append((start_time, end_time, line_display))
-            last_end_time = end_time
-            tail_count += 1
-            continue
-
-        # 1. 累積文字数 pos 周辺で行頭の prefix を局所検索
-        anchor = _local_anchor(line_norm, pos)
-        if anchor >= 0 and anchor != pos:
-            drift_sum += anchor - pos
-            anchored += 1
-            pos = anchor
-
-        end_pos = min(pos + line_len, total_chars) - 1
-        start_widx = char_to_word[pos]
-        end_widx = char_to_word[end_pos]
-        start_time = words[start_widx]["start"]
-        end_time = words[end_widx]["end"]
-
-        entries.append((start_time, end_time, line_display))
-        last_end_time = max(last_end_time, end_time)
-        pos += line_len
-        min_pos = pos  # 次行のアンカー検索はここより前を探さない
-
-    print(f"\n改行テキスト → SRT")
+    coverage = matched_chars / max(1, min(len(line_cat), total_chars))
+    print(f"\n改行テキスト → SRT（difflib 全体アライメント）")
     print(f"  入力行数: {len(lines)}")
     print(f"  生成エントリ数: {len(entries)}")
-    if tail_count:
-        print(f"  末尾補完（単語列超過）: {tail_count} 件（暫定 {TAIL_DUR_S}s/行）")
-    if anchored:
-        print(f"  アンカー再同期: {anchored} 行（累積drift補正合計 {drift_sum:+d} 文字）")
+    print(f"  アライメント一致率: {coverage * 100:.1f}%")
+    if coverage < 0.55:
+        print("  ⚠ 一致率が異常に低い: lines.txt と segments.json の組が正しいか確認してください")
 
     # タイミング調整
     entries = refine_timing(entries, fps)
@@ -1090,11 +1242,7 @@ def assemble_from_text(
     print(f"\n完了: {output_path}")
     print(f"  エントリ数: {len(entries)}")
     print(f"  fps: {fps}")
-    lens = [len(t) for _, _, t in entries]
-    if lens:
-        print(f"  平均文字数: {sum(lens)/len(lens):.1f}")
-        print(f"  25字超: {sum(1 for l in lens if l > 25)} 件")
-        print(f"  4字未満: {sum(1 for l in lens if l < 4)} 件")
+    qa_report(entries, srt_path=output_path)
 
 
 # ── Phase 2: SRTアセンブリ（LLM分割結果から） ────────────────────────────────
@@ -1197,6 +1345,10 @@ def main() -> None:
         help="LLMグルーピング結果（grouped.json）からSRTを組み立て",
     )
     parser.add_argument(
+        "--qa",
+        help="既存 SRT ファイルの品質チェックのみ実行して終了",
+    )
+    parser.add_argument(
         "--from-text",
         help="改行テキスト（.txt）から直接 SRT を生成（v5 メイン経路）。"
              "segments.json（--segments）と併用。",
@@ -1213,7 +1365,7 @@ def main() -> None:
         "--output-dir",
         help="全ての出力ファイルをこのディレクトリに配置する。"
              "指定しない場合は入力ファイルと同じディレクトリ。"
-             "推奨: ~/ClaudeCode/projects/premiere-skills/output/srt/<video-name>/",
+             "推奨: $REPO_DIR/output/srt/<video-name>/",
     )
     args = parser.parse_args()
 
@@ -1242,6 +1394,14 @@ def main() -> None:
             print(f"エラー: XMLが見つかりません: {args.xml}")
             sys.exit(1)
         xml_path = args.xml
+
+    # ── QA: 既存 SRT の品質チェックのみ ──
+    if args.qa:
+        if not os.path.exists(args.qa):
+            print(f"エラー: SRTが見つかりません: {args.qa}")
+            sys.exit(1)
+        qa_report(_parse_srt_file(args.qa), srt_path=args.qa)
+        return
 
     # ── Phase 2: SRTアセンブリ ──
     if args.assemble:

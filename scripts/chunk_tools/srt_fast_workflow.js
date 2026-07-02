@@ -15,9 +15,8 @@ const TOOLS = `${REPO}/scripts/chunk_tools`
 const SETUP = `${TOOLS}/setup_chunks.py`
 const HELPER = `${TOOLS}/whisper_chunk.py`
 const ASSEMBLE = `${TOOLS}/assemble_chunks.py`
-const MEM1 = `${REPO}/memory/feedback_srt_grouping_rules.md`
-const MEM2 = `${REPO}/memory/telop_channel_patterns.md`
-const CPU_THREADS = 4
+// 実行時ルール正典（memory 2ファイル約58KBの蒸留版・約7KB。トークン節約と指示の一点集約）
+const RULES = `${REPO}/references/srt_runtime_rules.md`
 
 // ── 入力（args でWAV絶対パスを渡す。分割は本Workflow内で実施） ──
 //   Workflow({ scriptPath: "...srt_fast_workflow.js", args: "/abs/path/to/audio.wav" })
@@ -99,35 +98,29 @@ stem, out_dir, duration, chunks[{idx,wav,offset,owned_start,owned_end}] を返�
 
 function chunkPrompt(m, c) {
   const seg = `${m.out_dir}/${m.stem}.chunk${c.idx}.segments.json`
+  const ovl = `${m.out_dir}/${m.stem}.chunk${c.idx}.overlap.json`
   const full = `${m.out_dir}/${m.stem}.chunk${c.idx}.fulltext.txt`
   const lines = `${m.out_dir}/${m.stem}.chunk${c.idx}.lines.txt`
   return `あなたは日本語トーク動画のSRTテロップ生成パイプラインのチャンク担当エージェントです。長いトークを時間で${m.chunks.length}分割した ${c.idx}/${m.chunks.length} 区間(担当グローバル区間 ${c.owned_start}s〜${c.owned_end}s)を担当します。自分の担当区間だけを処理。パスは【】や空白を含むのでbashでは必ずダブルクオートで囲む。
 
 ## Step A: Whisper転写（bash・1回だけ）
 \`\`\`
-T0=$(date +%s); python3 "${HELPER}" --audio "${c.wav}" --offset ${c.offset} --owned-start ${c.owned_start} --owned-end ${c.owned_end} --cpu-threads ${CPU_THREADS} --out "${seg}" --fulltext "${full}" --script "${CANONICAL}"; T1=$(date +%s); echo "WHISPER_SECONDS=$((T1-T0))"
+T0=$(date +%s); python3 "${HELPER}" --audio "${c.wav}" --offset ${c.offset} --owned-start ${c.owned_start} --owned-end ${c.owned_end} --jobs ${m.chunks.length} --out "${seg}" --overlap-out "${ovl}" --fulltext "${full}" --script "${CANONICAL}"; T1=$(date +%s); echo "WHISPER_SECONDS=$((T1-T0))"
 \`\`\`
-完了で ${seg}(担当区間のsegments.json・グローバル時刻baked) と ${full}(担当区間の修正済み全文) が生成。オーバーラップ食い込み分は helper 側で除去済み。固有名詞は既に正規化済み。WHISPER_SECONDS を控える。
+完了で ${seg}(担当区間のsegments.json・グローバル時刻baked) と ${full}(担当区間の修正済み全文) が生成。担当外セグメントは ${ovl} に退避され、最終フェーズが境界欠落の復元に使う。固有名詞は既に正規化済み。WHISPER_SECONDS を控える。
 
 ## Step B: ルール読込（必須）
-Readで次2ファイルを読む(全ルール厳守): ${MEM1} / ${MEM2}
+Readで実行時ルール正典を読む(全ルール厳守): ${RULES}
 
 ## Step C: 全文を読む
 Readで ${full} を読む。
 
 ## Step D: 意味区切り改行 → lines.txt を Write
-${full} を意味の区切りで改行し各行=1テロップにして ${lines} に Write。要点:
-- 意味の区切りで切る(平均14字前後・5〜25字目安だが文字数より意味優先)
-- 複合動詞句は分断しない(〜ている/〜ていく/〜てくる/〜てみる/〜ておく/〜てしまう 等は1行)
-- 副詞句(徹底的に/本当に/しっかりと)は次行の先頭
-- 話題転換(説明→CTA・概念→具体例・肯定→疑問)で切る
-- 「〜おり/ており」「〜ですけども」「〜なんですけど」で切る
-- 文頭禁止: ます/まし/ない/とき/こと/助詞単独 等で始めない(前行に結合)
-- フィラー「こう」「ちょっと」は文脈判断で残す(全削除禁止)
-- メタコメント/時間稼ぎ/主観の冗長形は削除候補。句読点(、。)は使わない(中黒・半角スペースは可)
-- 25字超は1%未満・4字未満も最小限
-【最重要】固有名詞は ${full} の表記をそのまま使う(英字↔カタカナ変換しない＝累積ズレ防止)。基本は改行を入れるだけ。フィラー/メタの軽い削除のみ可。
-【重要】この工程では --from-text や SRT 生成は実行しない。改行テキスト(${lines})を書くだけ。SRT 組み立ては最終フェーズで全文を一度に行う。
+${full} をルール正典に従って意味の区切りで改行し、各行=1テロップにして ${lines} に Write。
+【最重要・チャンク特有の注意】
+- 固有名詞は ${full} の表記をそのまま使ってよいし、ルール正典の確定表記へ修正してもよい(v6は全体アライメントなので時刻はズレない)。ただし迷ったら ${full} のまま
+- この工程では --from-text や SRT 生成は実行しない。改行テキスト(${lines})を書くだけ。SRT 組み立ては最終フェーズで全文を一度に行う
+- 自分のチャンクは全体の1/${m.chunks.length}しか見えていない。文脈が切れて見える冒頭/末尾の行も削除せず残す(境界deduplicationは最終フェーズが行う)
 
 ## 返却(StructuredOutput)
 idx=${c.idx}, segCount(=${seg}配列長), lineCount(=${lines}非空行数), whisperSeconds, linesPath="${lines}" を返す。`
@@ -141,7 +134,7 @@ function assemblePrompt(m) {
 \`\`\`
 python3 "${ASSEMBLE}" "${m.out_dir}/${m.stem}.chunks.json" "${CANONICAL}" "${out}"
 \`\`\`
-assemble_chunks.py が「owned segments を時刻順連結 → lines を連結(末尾幻聴フレーズ除去・境界重複行dedup) → 行↔word を difflib 全体アライメントで対応付け時刻割当 → refine_timing」して ${out} を生成する。canonical の前方バイアスのある局所アンカー(--from-text)は使わない(累積ドリフト/オーバーラン防止)。
+assemble_chunks.py が「owned+overlap segments を統合(境界欠落をoverlap転写から復元) → lines を連結(末尾幻聴フレーズ除去・境界重複行dedup・復元行挿入) → canonical assemble_from_text(v6 difflib全体アライメント+QAレポート)」で ${out} を生成する。
 
 ## Step 2: 品質統計
 ${out} を読み、totalEntries / 本文1行平均文字数 avgChars / 25字超 over25 / 4字未満 under4 / 最初の "-->" 行 firstTimecode / 最後の "-->" 行 lastTimecode / 連続エントリ間の最大空白秒 maxGapSeconds を算出。

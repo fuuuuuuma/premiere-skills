@@ -7,6 +7,8 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 ## Gotchas（Claudeがハマりやすいポイント）
 
 - **A2トラックの音声で無音検出してしまう** → 必ずA1（メインの声）で検出。A2はBGM等が入っていて判定が狂う
+- **A1自体にBGM/環境音が常時混入している素材** → 既定の -45dB では無音が検出できず「検出無音: 0箇所」で実質何もカットされない。まずBGM混入を疑い、`--threshold -35`〜`-40` を試す
+- **`--padding` を大きくしすぎる** → padding×2 ≥ min-silence だと全無音がパディングに食われて1フレームもカットされない（スクリプトが警告を出す）。padding は min-silence の半分未満にする
 - **全トラックに同じin/outを適用してしまう** → トラックごとにソースオフセットが異なる。`offset = in_frame - tl_start` を個別に保持すること
 - **Bashタイムアウトを指定し忘れる** → デフォルト2分で切れる。必ず `600000`（10分）を指定
 
@@ -25,11 +27,9 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 
 ## 出力先
 
-**必ず以下のディレクトリに出力すること**:
+**必ず premiere-skills リポジトリの `output/cut/` に出力すること**。
 
-```
-~/ClaudeCode/projects/常時運用/premiere-skills/output/cut/
-```
+worktree やカレントリポジトリのルートに出してはいけない（worktree から実行するとルートが worktree パスに解決され、過去のカット済みファイルと分離してしまう）。出力先は `$HOME/.claude/scripts/silence_cut.py`（premiere-skills への symlink）を `realpath` で解決して導出する。`/Users/...` のような絶対パスはハードコードしない（配布版が壊れるため）。
 
 出力ファイル名: `<入力ファイル名>_カット済み.xml`
 
@@ -38,9 +38,11 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 確認不要。即実行する。Bashのタイムアウトは必ず **600000** を指定すること。
 
 ```bash
-python3 "$HOME/.claude/scripts/silence_cut.py" \
+SCRIPT="$HOME/.claude/scripts/silence_cut.py"
+OUT_DIR="$(cd "$(dirname "$(realpath "$SCRIPT")")/.." && pwd)/output/cut"
+python3 "$SCRIPT" \
   "<XMLファイルの絶対パス>" \
-  --output-dir "$HOME/ClaudeCode/projects/常時運用/premiere-skills/output/cut"
+  --output-dir "$OUT_DIR"
 ```
 
 ## 結果報告
@@ -58,4 +60,4 @@ python3 "$HOME/.claude/scripts/silence_cut.py" \
 ─────────────────────────
 ```
 
-出力ファイルの絶対パス（`~/ClaudeCode/projects/常時運用/premiere-skills/output/cut/<basename>_カット済み.xml`）を必ず含め、Premiere Proで「ファイル > 読み込み」で読み込める旨を添える。
+出力ファイルの絶対パス（`$OUT_DIR/<basename>_カット済み.xml` の実値）を必ず含め、Premiere Proで「ファイル > 読み込み」で読み込める旨を添える。
