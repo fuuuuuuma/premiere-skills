@@ -83,6 +83,24 @@ for v in rec_by_boundary.values():
 def _normkey(s: str) -> str:
     return norm(apply_corrections(s))
 
+
+def _fuzzy_dup(a: str, b: str) -> bool:
+    """完全一致、または一方が他方の部分文字列（最小長6）なら同一発話とみなす。
+
+    2026-07-03 修正: 境界前後のチャンクが独立にLLM改行するため、同じ発話が
+    「このどちらか使っていただけたらなと思います」(chunk i 末尾) /
+    「のでこのどちらか使っていただけたらなと思います」(chunk i+1 先頭、接続の
+    「ので」が付いただけ)のように**非完全一致**で重複することがある。
+    完全一致のみの旧実装ではこれを見逃し、同一内容が2行のSRTエントリに
+    分裂して残っていた（実写E2Eで確認）。
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    s, l = (a, b) if len(a) <= len(b) else (b, a)
+    return len(s) >= 6 and s in l
+
 chunk_lines: list[list[str]] = []
 dropped_halluc = 0
 for c in chunks:
@@ -112,7 +130,7 @@ for ci, cl in enumerate(chunk_lines):
         head_keys = [_normkey(x) for x in cl[:MAX_DEDUP]]
         kmax = min(MAX_DEDUP, len(prev_tail_keys), len(head_keys))
         for k in range(kmax, 0, -1):
-            if prev_tail_keys[-k:] == head_keys[:k]:
+            if all(_fuzzy_dup(pt, hk) for pt, hk in zip(prev_tail_keys[-k:], head_keys[:k])):
                 drop_k = k
                 break
     if drop_k:
