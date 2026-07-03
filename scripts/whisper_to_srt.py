@@ -329,8 +329,196 @@ def remove_fillers(text: str) -> str:
 # ── Whisper ──────────────────────────────────────────────────────────────────
 
 
-def run_whisper(audio_path: str) -> list[dict]:
-    """Whisperを実行してセグメントリストを返す（word_timestamps含む）。"""
+MLX_MODEL = os.environ.get("SRT_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
+
+
+def run_whisper(audio_path: str, cpu_threads: int = 0) -> list[dict]:
+    """Whisperを実行してセグメントリストを返す（word_timestamps含む）。
+
+    2026-07-03 高速化: Apple Silicon では mlx-whisper (GPU・large-v3-turbo) を既定に。
+    実測(M4 Max・180s実音声): faster-whisper large-v3 CPU 54.5s → mlx turbo 9.8s(5.6倍)。
+    テキスト類似度0.91・一致語の開始時刻ずれ中央値80ms・内容欠落なしを確認済み
+    （mlx large-v3 非turbo はフレーズ欠落があり不採用）。
+    SRT_WHISPER_ENGINE=cpu で従来エンジン強制、SRT_WHISPER_MODEL でmlxモデル差し替え。
+    mlx-whisper 未導入・実行失敗時は faster-whisper (CPU) に自動フォールバック。
+    """
+    if platform.system() == "Darwin" and os.environ.get("SRT_WHISPER_ENGINE", "mlx") != "cpu":
+        try:
+            return _run_whisper_mlx(audio_path, cpu_threads)
+        except ImportError:
+            print("mlx-whisper 未導入 → faster-whisper (CPU) で続行。"
+                  "高速化: pip3 install --break-system-packages mlx-whisper")
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("mlx-whisper 失敗 → faster-whisper (CPU) にフォールバック")
+    return _run_whisper_faster(audio_path, cpu_threads)
+
+
+def _run_whisper_mlx(audio_path: str, cpu_threads: int = 0) -> list[dict]:
+    """mlx-whisper (Apple GPU) 経路。出力スキーマ・補正処理はCPU経路と完全一致。
+
+    mlx は VAD を持たず、長い無音明けの短い発話を落とすことがある（実測で確認）。
+    そのため転写後にタイムラインの未カバー区間だけを CPU+VAD で補完転写する
+    （_rescue_gaps）。字幕用途のカバレッジを baseline 同等に保つための必須工程。
+    """
+    import mlx_whisper  # 未導入なら ImportError → フォールバック
+
+    print(f"mlx-whisper {MLX_MODEL} (Apple GPU) 転写中: {audio_path}")
+    result = mlx_whisper.transcribe(
+        audio_path,
+        path_or_hf_repo=MLX_MODEL,
+        language="ja",
+        word_timestamps=True,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        hallucination_silence_threshold=2.0,
+    )
+
+    seg_list = []
+    for seg in result["segments"]:
+        raw_text = apply_corrections(seg["text"].strip())
+        clean_text = remove_fillers(raw_text)
+        if not clean_text:
+            continue
+
+        words = []
+        for w in seg.get("words", []):
+            word_raw = apply_corrections(w["word"].strip())
+            word_clean = remove_fillers(word_raw)
+            if word_clean:
+                words.append({
+                    "word": word_clean,
+                    "start": w["start"],
+                    "end": w["end"],
+                })
+
+        seg_list.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": clean_text,
+            "words": words,
+        })
+
+    seg_list = _rescue_gaps(audio_path, seg_list, cpu_threads)
+
+    print(f"Whisperセグメント数: {len(seg_list)}")
+    return seg_list
+
+
+GAP_RESCUE_MIN_S = 1.5   # merge_segments.py の空白警告閾値と揃える
+GAP_RESCUE_MARGIN_S = 0.25
+
+
+GAP_RESCUE_SPACER_S = 2.0  # 連結時の無音スペーサ（VADに区間境界を跨がせない）
+GAP_RESCUE_SR = 16000
+
+
+def _rescue_gaps(audio_path: str, seg_list: list[dict], cpu_threads: int = 0) -> list[dict]:
+    """mlx転写の未カバー区間（無音扱いされた区間）だけを CPU+VAD で補完転写する。
+
+    大半の空白は真の無音だが、無音明けの短い接続句が落ちるケースがある（実測）。
+    Whisperは音声長に関わらず30秒窓単位で推論するため、区間を1本ずつ転写すると
+    区間数×窓コストで長尺動画が破綻する。→ 全区間を無音スペーサ入りで1本の
+    音声に連結し、CPU+VADで**1回だけ**転写してから元のタイムラインへ写像する。
+    """
+    import subprocess
+    import tempfile
+    import wave
+
+    try:
+        dur = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip())
+    except Exception:
+        dur = float(seg_list[-1]["end"]) if seg_list else 0.0
+
+    gaps = []
+    prev = 0.0
+    for s in seg_list:
+        if s["start"] - prev >= GAP_RESCUE_MIN_S:
+            gaps.append((float(prev), float(s["start"])))
+        prev = max(prev, s["end"])
+    if dur - prev >= GAP_RESCUE_MIN_S:
+        gaps.append((float(prev), dur))
+    if not gaps:
+        return seg_list
+
+    print(f"gap補完: {len(gaps)}区間を連結してCPU Whisper(VAD付き)で再転写 "
+          f"{[(round(float(a), 1), round(float(b), 1)) for a, b in gaps]}")
+
+    # 各gap（±マージン）を s16le/16k/mono で切り出し、無音スペーサを挟んで連結
+    spacer = b"\x00\x00" * int(GAP_RESCUE_SPACER_S * GAP_RESCUE_SR)
+    slices = []   # (concat開始秒, 元音声開始秒, スライス長秒)
+    pcm_parts = []
+    concat_pos = 0.0
+    for g0, g1 in gaps:
+        s0 = max(0.0, g0 - GAP_RESCUE_MARGIN_S)
+        length = g1 - s0 + GAP_RESCUE_MARGIN_S
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", str(s0), "-t", str(length),
+             "-i", audio_path, "-f", "s16le", "-acodec", "pcm_s16le",
+             "-ac", "1", "-ar", str(GAP_RESCUE_SR), "-"],
+            capture_output=True, timeout=120, check=True,
+        )
+        pcm = r.stdout
+        slices.append((concat_pos, s0, len(pcm) / 2 / GAP_RESCUE_SR))
+        pcm_parts.append(pcm)
+        pcm_parts.append(spacer)
+        concat_pos += len(pcm) / 2 / GAP_RESCUE_SR + GAP_RESCUE_SPACER_S
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    try:
+        with wave.open(tmp, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(GAP_RESCUE_SR)
+            wf.writeframes(b"".join(pcm_parts))
+
+        model = _fw_load_model(cpu_threads)
+        # 30秒窓の中で複数スライスが1セグメントに融合することがあるため、
+        # セグメント単位ではなく語タイムスタンプ単位でスライスへ写像し、
+        # スライスごとにセグメントを組み直す。
+        words_by_slice = {}
+        for seg in _fw_transcribe(model, tmp):
+            for w in seg["words"]:
+                mid_local = (w["start"] + w["end"]) / 2
+                for k, (c0, s0, slen) in enumerate(slices):
+                    if c0 <= mid_local < c0 + slen:
+                        g0, g1 = gaps[k]
+                        shift = s0 - c0
+                        if g0 <= mid_local + shift < g1:  # マージン由来の重複は捨てる
+                            words_by_slice.setdefault(k, []).append({
+                                "word": w["word"],
+                                "start": w["start"] + shift,
+                                "end": w["end"] + shift,
+                            })
+                        break
+        rescued = []
+        for k, words in sorted(words_by_slice.items()):
+            rescued.append({
+                "start": words[0]["start"],
+                "end": words[-1]["end"],
+                "text": "".join(w["word"] for w in words),
+                "words": words,
+            })
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    if rescued:
+        print(f"gap補完: {len(rescued)}セグメント回復 "
+              f"{[s['text'][:15] for s in rescued]}")
+        seg_list = sorted(seg_list + rescued, key=lambda s: s["start"])
+    return seg_list
+
+
+def _fw_load_model(cpu_threads: int = 0):
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -344,9 +532,20 @@ def run_whisper(audio_path: str) -> list[dict]:
         device, compute_type = "auto", "auto"
 
     print(f"Whisper large-v3 を読み込み中... (device={device})")
-    model = WhisperModel("large-v3", device=device, compute_type=compute_type)
-    print(f"文字起こし中: {audio_path}")
+    return WhisperModel("large-v3", device=device, compute_type=compute_type,
+                        cpu_threads=cpu_threads)
 
+
+def _run_whisper_faster(audio_path: str, cpu_threads: int = 0) -> list[dict]:
+    """faster-whisper (CPU) 経路 — 従来実装そのまま。"""
+    model = _fw_load_model(cpu_threads)
+    print(f"文字起こし中: {audio_path}")
+    seg_list = _fw_transcribe(model, audio_path)
+    print(f"Whisperセグメント数: {len(seg_list)}")
+    return seg_list
+
+
+def _fw_transcribe(model, audio_path: str) -> list[dict]:
     # 高速化: beam_size=1 (greedy), best_of=1, VAD しきい値緩め
     # large-v3 を維持しつつ、推論コストを 1/5 に削減（約2〜3倍高速）
     segments, _ = model.transcribe(
@@ -393,7 +592,6 @@ def run_whisper(audio_path: str) -> list[dict]:
             "words": words,
         })
 
-    print(f"Whisperセグメント数: {len(seg_list)}")
     return seg_list
 
 

@@ -37,12 +37,13 @@ WAV (16kHz / モノラル / 16bit 推奨) と XML を出力してから:
 
 - macOS / Linux (Premiere Pro 自体は別途必要)
 - Python 3.9 以降
-- `faster-whisper` (Whisper large-v3)
+- `mlx-whisper` (Apple Silicon の既定転写エンジン・large-v3-turbo・GPU実行。2026-07-03 v6.1)
+- `faster-whisper` (Whisper large-v3。gap補完・非Apple環境・フォールバックに必須)
 - `ffmpeg`
 - Claude Code CLI
 
 ```bash
-pip3 install --user faster-whisper
+pip3 install --user faster-whisper mlx-whisper
 brew install ffmpeg
 ```
 

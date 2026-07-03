@@ -21,7 +21,6 @@ usage:
 import argparse
 import json
 import os
-import platform
 import importlib.util
 from pathlib import Path
 
@@ -45,69 +44,35 @@ overlap_out = a.overlap_out or str(Path(a.out).with_suffix("")) + ".overlap.json
 if a.out.endswith(".segments.json"):
     overlap_out = a.overlap_out or a.out[: -len(".segments.json")] + ".overlap.json"
 
-# canonical モジュールを import（apply_corrections / remove_fillers を再利用）
+# canonical モジュールを import（run_whisper / apply_corrections / remove_fillers を再利用）
 spec = importlib.util.spec_from_file_location("w2s", a.script)
 w2s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w2s)
 
-from faster_whisper import WhisperModel  # noqa: E402
-
-if platform.system() == "Darwin":
-    device, compute_type = "cpu", "int8"
-else:
-    device, compute_type = "auto", "auto"
-
-print(f"[chunk] WhisperModel large-v3 device={device} cpu_threads={cpu_threads} (jobs={a.jobs})")
-model = WhisperModel("large-v3", device=device, compute_type=compute_type,
-                     cpu_threads=cpu_threads)
-
-# ── 転写パラメータは canonical whisper_to_srt.py と一致（変えると /srt と精度が乖離する）──
-segments, _ = model.transcribe(
-    a.audio,
-    language="ja",
-    word_timestamps=True,
-    vad_filter=True,
-    vad_parameters={
-        "threshold": 0.45,
-        "min_silence_duration_ms": 500,
-        "speech_pad_ms": 200,
-    },
-    beam_size=1,
-    best_of=1,
-    temperature=0.0,
-    condition_on_previous_text=False,
-    no_speech_threshold=0.6,
-    hallucination_silence_threshold=2.0,
-)
+# ── 転写は canonical run_whisper に委譲 ──
+# エンジン選択(mlx GPU / faster-whisper CPU)・転写パラメータ・補正処理を
+# whisper_to_srt.py 一箇所に集約（分岐を持つと /srt と精度が乖離するため）。
+print(f"[chunk] canonical run_whisper に委譲 cpu_threads={cpu_threads} (jobs={a.jobs})")
+raw_segs = w2s.run_whisper(a.audio, cpu_threads=cpu_threads)
 
 off = a.offset
 os_, oe = a.owned_start, a.owned_end
 seg_list = []
 overlap_list = []
-for seg in segments:
-    raw = w2s.apply_corrections(seg.text.strip())
-    clean = w2s.remove_fillers(raw)
-    if not clean:
-        continue
-    words = []
-    if seg.words:
-        for wd in seg.words:
-            wr = w2s.apply_corrections(wd.word.strip())
-            wc = w2s.remove_fillers(wr)
-            if wc:
-                words.append({
-                    "word": wc,
-                    "start": round(wd.start + off, 3),
-                    "end": round(wd.end + off, 3),
-                })
+for seg in raw_segs:
+    words = [{
+        "word": wd["word"],
+        "start": round(wd["start"] + off, 3),
+        "end": round(wd["end"] + off, 3),
+    } for wd in seg["words"]]
     entry = {
-        "start": round(seg.start + off, 3),
-        "end": round(seg.end + off, 3),
-        "text": clean,
+        "start": round(seg["start"] + off, 3),
+        "end": round(seg["end"] + off, 3),
+        "text": seg["text"],
         "words": words,
     }
     # 所有判定は中点基準（開始時刻基準だと境界を跨ぐ発話が両チャンクから落ちる）
-    mid = (seg.start + seg.end) / 2 + off
+    mid = (seg["start"] + seg["end"]) / 2 + off
     if os_ <= mid < oe:
         seg_list.append(entry)
     else:

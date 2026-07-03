@@ -9,11 +9,16 @@ N チャンクに分けて並列実行し、最後の SRT 組み立てだけ全�
 
 実測（テスト.wav 653秒 / 2026-05-29 ベンチ）: 通常 `/srt` 593.5秒 に対し 3分割版は約337秒で **約1.8倍速**。
 
+**2026-07-03 (v6.1)**: 転写エンジンが mlx-whisper (Apple GPU) 既定になり、転写自体が
+CPU 比 3倍以上速くなった（canonical `whisper_to_srt.py` の run_whisper に委譲・gap補完内蔵）。
+GPU は単一資源のため転写の並列化メリットは縮小したが、意味区切り改行のLLM並列は引き続き有効。
+`SRT_WHISPER_ENGINE=cpu` で従来エンジン強制（詳細は srt.md 設計原則）。
+
 ## 設計原則（ベンチで判明した欠陥への対策を内蔵・v6 で canonical と実装統合）
 
 ```
 [split]   silencedetect(強め d=0.7)で N 分割。各chunkは担当区間±オーバーラップで抽出   [約1秒]
-[並列]    各chunk: Whisper(large-v3) → 意味区切り改行(lines.txt)                        [3並列で約3分]
+[並列]    各chunk: Whisper(GPU既定) → 意味区切り改行(lines.txt)                         [並列で約1〜3分]
 [assemble] segments統合(境界欠落をoverlapから復元) + lines連結(dedup) → canonical
            assemble_from_text(difflib全体アライメント+QA) → 最終SRT                     [約10秒]
 ─────────────────────────────────────────────────────────

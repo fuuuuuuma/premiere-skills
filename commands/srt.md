@@ -7,17 +7,24 @@ description: WAV音声＋Premiere Pro XML からカット点同期SRT字幕を�
 ## 設計原則
 
 ```
-[機械]   transcribe_parallel.py: 3分割並列Whisper(large-v3) → segments.json + fulltext.txt  [約3〜4分]
+[機械]   transcribe_parallel.py: 並列Whisper → segments.json + fulltext.txt  [GPU: 約1〜2分 / CPU: 約3〜4分]
 [LLM]    意味の区切りで改行したテキストを .txt に出力（ルール正典1ファイル参照）        [約3分]
 [機械]   --from-text: difflib全体アライメントで時刻割当 → SRT + QAレポート               [約10秒]
 ─────────────────────────────────────────────────
-合計: 約6〜8分（28分音声想定。v5 実測13分34秒 → 約半分）
+合計: 約4〜5分（28分音声・GPU転写想定。v5 実測13分34秒 → 約1/3）
 ```
 
 - **時刻割当は difflib 全体アライメント**（v6）。lines.txt 側の固有名詞修正が CORRECTIONS 辞書に
   未登録でも時刻はズレない（v5 の「辞書同期必須」制約は廃止。辞書追加は転写品質向上のための推奨事項）
+- **転写エンジンは mlx-whisper (Apple GPU・large-v3-turbo) が既定**（2026-07-03 v6.1）。
+  実測(M4 Max・180s): CPU large-v3 54.5s → GPU+gap補完 17.2s(3.2倍)。mlx は VAD 無しで
+  無音明けの短い発話を落とすため、未カバー区間だけを CPU large-v3+VAD で補完転写する
+  （gap rescue・whisper_to_srt.py 内蔵）。カバレッジは従来比で同等以上を実測確認済み。
+  `SRT_WHISPER_ENGINE=cpu` で従来の faster-whisper (CPU) を強制、
+  `SRT_WHISPER_MODEL` で mlx モデル差し替え。mlx-whisper 未導入時は自動フォールバック
 - **転写は3プロセス並列**（LLM/エージェント不使用の機械工程。トークン消費ゼロ）。
-  チャンク境界の欠落は overlap 転写からの自動復元で対策済み
+  チャンク境界の欠落は overlap 転写からの自動復元で対策済み。
+  ※GPU転写時は並列の伸びは小さい（GPUは単一資源のため。壊れはしない）
 - **品質チェックはスクリプト内蔵**（Step 6 の出力に QA レポートが含まれる。LLM が SRT を読み直さない）
 
 ## 重要ルール
