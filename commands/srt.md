@@ -117,7 +117,16 @@ python3 "$SCRIPT" \
 **25字超・文頭NG候補が指摘されたら、該当行だけ lines.txt を修正して Step 6 を再実行**
 （QA が「✅ 要修正なし」になるか、意味的にこれ以上割れないと判断するまで）。
 
+**exit 条件（無限ループ防止）**: QA 再実行は最大2回まで。2回目の再実行後も issue が0件に
+ならない場合は、それ以上のリトライをせず理由を報告してそのまま Step 7 の完了報告に進む。
+
 ### Step 7: 完了報告
+
+完了報告の前に、中間ファイルを削除する（絶対パスの rm。LLM 任せの判断にしない）:
+
+```bash
+rm -f "$OUTPUT_DIR/$VIDEO_BASENAME.fulltext.txt" "$OUTPUT_DIR"/chunk*.fulltext.txt
+```
 
 1. SRT の絶対パス
 2. **Step 6 標準出力の QA レポートをそのまま転記**（SRT を Read し直して再集計しない）
@@ -141,4 +150,4 @@ python3 "$SCRIPT" \
 - **実行時ルール正典（Step 5 で必読）**: `references/srt_runtime_rules.md`
 - ルールの原典・過去の失敗例と経緯: `memory/feedback_srt_grouping_rules.md`
 - チャンネル固有名詞辞書（完全版）: `memory/telop_channel_patterns.md`
-- 品質チェック: `--qa <srt>` フラグでいつでも単体実行可（references/srt_quality_check.md は旧手順）
+- 品質チェック: `--qa <srt>` フラグでいつでも単体実行可（旧手順は references/archive/srt_quality_check.md）

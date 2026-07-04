@@ -12,19 +12,31 @@
     後段(whisper_chunk.py)が owned 区間だけを採用してオーバーラップ分は捨てる。
 
 usage:
-  setup_chunks.py <input> <repo_dir> <n_chunks> [overlap_s=6.0] [silence_d=0.7]
+  setup_chunks.py <input> <repo_dir> <n_chunks> [overlap_s=6.0] [silence_d=0.7] [--noise -30]
 """
 import sys
 import re
 import json
+import argparse
 import subprocess
 from pathlib import Path
 
-src = sys.argv[1]
-repo = sys.argv[2]
-n = int(sys.argv[3])
-OVERLAP = float(sys.argv[4]) if len(sys.argv) > 4 else 6.0
-SILENCE_D = float(sys.argv[5]) if len(sys.argv) > 5 else 0.7
+parser = argparse.ArgumentParser()
+parser.add_argument("input")
+parser.add_argument("repo_dir")
+parser.add_argument("n_chunks", type=int)
+parser.add_argument("overlap_s", type=float, nargs="?", default=6.0)
+parser.add_argument("silence_d", type=float, nargs="?", default=0.7)
+parser.add_argument("--noise", type=float, default=-30,
+                     help="silencedetect の noise 閾値(dB)。BGM/環境音が多い素材は -40 等に下げる（既定 -30）")
+parsed = parser.parse_args()
+
+src = parsed.input
+repo = parsed.repo_dir
+n = parsed.n_chunks
+OVERLAP = parsed.overlap_s
+SILENCE_D = parsed.silence_d
+NOISE_DB = parsed.noise
 
 stem = Path(src).stem
 out_dir = Path(repo) / "output" / "srt" / stem
@@ -50,7 +62,7 @@ duration = float(probe.stdout.strip())
 # 3) silencedetect（強めの無音 = 文の切れ目を狙う）
 sd = subprocess.run(
     ["ffmpeg", "-hide_banner", "-i", str(full_wav),
-     "-af", f"silencedetect=noise=-30dB:d={SILENCE_D}", "-f", "null", "-"],
+     "-af", f"silencedetect=noise={NOISE_DB}dB:d={SILENCE_D}", "-f", "null", "-"],
     capture_output=True, text=True,
 )
 log = sd.stderr

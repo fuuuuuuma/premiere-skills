@@ -45,7 +45,10 @@ lines.txt 側の固有名詞修正が辞書に無くても累積タイムズレ�
 
 ### 5. canonical ファイルはこのプロジェクトフォルダ内
 
-`~/.claude/commands/*.md` と `~/.claude/scripts/*.py` は symlink。**編集は必ずこのプロジェクトフォルダ内で行う**。
+symlink されているのは `~/.claude/commands/cut.md` `srt.md` `srt-fast.md` の3本と、
+canonical スクリプト2本（`~/.claude/scripts/silence_cut.py` `whisper_to_srt.py`）のみ。
+`transcribe_parallel.py` / `mic_gate.py` / `chunk_tools/` 配下はこのリポジトリ内にのみ存在し、
+symlink はされていない。**編集は必ずこのプロジェクトフォルダ内で行う**。
 
 ## メモリファイル
 

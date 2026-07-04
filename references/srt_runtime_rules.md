@@ -117,3 +117,35 @@
 
 - 1行 = 1テロップ。空行 = 段落区切り（SRT には反映されない）
 - 見出し・番号・コメントを書かない。テロップ本文だけを書く
+
+## 9. 学習ワークフロー（継続改善サイクル）
+
+1. `/srt` で生成
+2. Premiere Pro でテロップを手動微調整
+3. 修正済み SRT + WAV + XML を `@修正済みSRT @WAV @XML` で渡す
+4. 差分分析 → `memory/feedback_srt_grouping_rules.md` + `memory/telop_channel_patterns.md` に蓄積
+5. 次回の生成に反映
+
+## 10. トラブルシューティング
+
+| エラー | 対処 |
+|---|---|
+| `faster-whisper が見つかりません` | `pip3 install --user faster-whisper` |
+| Whisperタイムアウト | Bashタイムアウトを 600000ms に設定 |
+| Whisperハリュシネーションループ | `condition_on_previous_text=False` を確認 |
+| SRT が Premiere で文字化け | UTF-8 BOM + CRLF か品質チェックで確認 |
+| XMLパースエラー | Premiere から「Final Cut Pro XML」で再書き出し（prproj は不可） |
+| `segments.json が見つからない` | Step 3（Whisper 転写）を再実行 |
+
+対応環境: macOS / Linux（Windows は未検証）、Python 3.9 以降、Claude Code CLI、faster-whisper（または mlx-whisper） + ffmpeg。
+
+## 11. 推奨WAV書き出し設定
+
+**重要**: WAV は Premiere Pro タイムラインの **OP 以降** の音声を書き出すこと。
+
+| 項目 | 推奨値 | 備考 |
+|---|---|---|
+| 書き出し範囲 | OP終了〜本編終了 | WAV の 0 秒 = タイムラインの OP 終了位置 |
+| サンプルレート | 16,000 Hz | Whisper 内部処理と同一 |
+| チャンネル | モノラル | ステレオ不要 |
+| サンプルサイズ | 16-bit | 24-bit は不要 |

@@ -13,7 +13,7 @@ Premiere Pro と Claude Code を組み合わせた動画編集自動化スキル
 |---|---|---|---|
 | `/cut` | Premiere Pro XML の無音・雑音区間をジェットカット | `.xml` | `output/cut/<basename>_カット済み.xml` |
 | `/srt` | WAV + Premiere Pro XML から日本語テロップ用 SRT を生成 (並列Whisper→LLM改行→全体アライメント・v6) | `.wav` + `.xml` | `output/srt/<basename>/<basename>.srt` ほか中間 JSON |
-| `/srt-fast` | /srt の高速版。転写＋改行を3チャンク並列（WAV単体専用・XML非対応） | `.wav` | `output/srt/<basename>/<basename>.fast.srt` |
+| `/srt-fast` | /srt の高速版（v7）。単一パスGPU転写＋改行のみN並列＋QA自動修復。`--xml` 併用でカット点同期も可（canonical共通） | `.wav`（＋任意 `.xml`） | `output/srt/<basename>/<basename>.fast.srt` |
 
 ## 使い方
 
