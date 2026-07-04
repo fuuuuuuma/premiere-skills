@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """チャンク転写結果（owned + overlap）を単一の segments リストへ統合する共有モジュール。
 
-/srt の並列転写（transcribe_parallel.py）と /srt-fast の組み立て
-（assemble_chunks.py）の両方が使う。
+/srt の並列転写（transcribe_parallel.py・/srt-fast の CPU フォールバックも同経路）が使う。
+（旧利用者 assemble_chunks.py は 2026-07-04 の /srt-fast v7.1 で廃止・削除済み）
 
 境界欠落の恒久対策（2026-07-02）:
   チャンク境界を跨ぐ発話は、各チャンクが独立に VAD を通るため

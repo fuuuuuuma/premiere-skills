@@ -232,6 +232,9 @@ CORRECTIONS: dict[str, str] = {
     "フェイブル": "Fable",
     "オープンAI": "OpenAI",
     "AIかける動画編集": "AI×動画編集",    # 企画名の正規表記（「かける」=×）
+    # ── bench.wav v7 E2E 新出（2026-07-04） ──
+    "[NAME]": "[NAME]",               # オーナー名の誤変換（かわむらふうま）
+    "株式会社NH": "[COMPANY]",     # 社名（NH→[COMPANY]は既存パターンの社名前置き版）
 }
 
 # 文脈ガード付き置換（str.replace の全置換だと「ワークフロー→ワークFlow」のような
@@ -1225,6 +1228,18 @@ def qa_report(
         print("  ✅ 要修正なし")
     else:
         print(f"  ⚠ 要修正候補 {issues} 件（25字超・文頭NGは lines.txt を直して再実行）")
+    # SRT_QA_JSON=1 のとき機械可読な1行を末尾に追加出力（/srt-fast の自動修復ループ用。
+    # 既定では出さないので /srt のレポート転記には影響しない）
+    if os.environ.get("SRT_QA_JSON"):
+        print("QA_JSON: " + json.dumps({
+            "total": len(entries),
+            "avg_chars": round(sum(lens) / len(lens), 2) if lens else 0,
+            "over25": len(over25), "under4": len(under4), "head_ng": len(head_ng),
+            "zero_dur": zero_dur, "overlaps": overlaps, "gaps500": gaps500,
+            "max_gap": round(max_gap, 2), "max_gap_at": round(max_gap_at, 1),
+            "over25_items": [[i, t] for i, t in over25[:30]],
+            "head_ng_items": [[i, t] for i, t in head_ng[:30]],
+        }, ensure_ascii=False))
     return issues
 
 
