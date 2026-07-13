@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# チャンネル固有設定（セットアップ対話で生成される個人設定。テンプレは config/*.example.*）
+config/channel_profile.md
+config/corrections.local.json

@@ -63,6 +63,25 @@ Step 4 の `--from-text` に引き渡される（2026-07-04 追加・実走検�
 
 ## 実行手順
 
+### Step 0: 初回セットアップ確認（`config/channel_profile.md` が無い場合のみ）
+
+`config/channel_profile.md` の存在を確認する。**存在すれば何もせず Step 1 へ**。
+**存在しなければ**、本処理に入る前にユーザーへ次を1回にまとめて質問する（全項目任意・
+「わからない/後で」でも構わないと伝える）:
+
+1. チャンネル名（自己紹介テロップ等で使う）
+2. テロップの目標文字数（既定値: 平均14字前後・25字超1%未満。変更したい場合のみ数値を）
+3. このチャンネルでよく出る固有名詞・製品名・人名で、Whisperが誤変換しそうなもの（言い間違いの
+   パターンが今分かる範囲でよい。無ければ空でよく、生成のたびに追記していけると伝える）
+4. 半角スペースの使い方に強いこだわりがあるか（無ければ既定ルールのまま進める）
+
+回答を受けて:
+- `config/channel_profile.example.md` の書式に沿って `config/channel_profile.md` を作成
+- 固有名詞の回答があれば `config/corrections.local.json` に `{"誤認識文字列": "正規表記"}` の
+  形式（`config/corrections.example.json` 参照）で保存
+- 「この設定は次回以降も自動で使われます。追加・修正したくなったら `config/` 内のファイルを
+  直接編集するか、生成のたびに気づいた誤認識を教えてください」と伝えてから Step 1 へ進む
+
 ### Step 1: 入力確認
 
 引数の音声/動画の絶対パスを確認する（存在しなければユーザーに確認）。パスは【】や空白を含み得るので
@@ -92,6 +111,8 @@ Read で `<stem>.parts.json` を取得し、**parts の数だけ Agent を同一
 
 ## Step 1: ルール正典を読む（必須・全ルール厳守）
 Read: /Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/references/srt_runtime_rules.md
+Read: /Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/config/channel_profile.md
+（存在すれば。無ければスキップしてよい。存在すればそこに書かれたチャンネル固有の表記・目標値を優先する）
 
 ## Step 2: 担当パート全文を読む
 Read: {parts[i].path}
@@ -169,9 +190,8 @@ rm -f "<out_dir>/<stem>".part*.txt "<out_dir>/<stem>".part*.lines.txt
 - エントリ数/平均文字数の代表値: 81行 / 12.9字（目標14字前後）。文頭NG・0ms・時間重複は 0。
   境界重複/欠落は**機構ごと消滅**（転写に境界なし。部境界118.9s の接続を目視確認済み）。
 - 転写品質は /srt と完全同一（単一パス＋gap補完）。
-- 新出の固有名詞誤認識を見つけたら CORRECTIONS 辞書＋`memory/telop_channel_patterns.md` に
-  追記し、上記 --from-text を再実行すれば表示行にも即反映される（2026-07-04 に
-  [NAME]→[NAME]・株式会社NH→[COMPANY] で実証）。
+- 新出の固有名詞誤認識を見つけたら `config/corrections.local.json`＋`memory/telop_channel_patterns.md` に
+  追記し、上記 --from-text を再実行すれば表示行にも即反映される（実データ検証で実証済み）。
 
 ### v6実測（参考値・アーカイブ経路・2026-05-30 テスト.wav / 2026-07-03 実写E2E）
 

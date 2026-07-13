@@ -1,0 +1,5 @@
+{
+  "_readme": "これはテンプレートです。実際の設定は config/corrections.local.json（gitignore対象）に書きます。/srt-fast の Step 0 セットアップ対話で自動生成されるので、通常は手で編集する必要はありません。手動で作る場合はこのファイルを config/corrections.local.json としてコピーし、_readme キーは削除してください。",
+  "サンプル誤変換": "サンプル正規表記",
+  "AIカラボ": "AIラボ"
+}

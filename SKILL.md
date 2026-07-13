@@ -33,6 +33,26 @@ WAV (16kHz / モノラル / 16bit 推奨) と XML を出力してから:
 @/path/to/audio.wav @/path/to/timeline.xml /srt
 ```
 
+### /srt-fast — 高速版 SRT 生成
+
+WAV (16kHz / モノラル / 16bit 推奨) を出力してから:
+
+```
+/srt-fast /path/to/audio_or_video
+```
+
+**初回実行時のみ**、チャンネル名・目標文字数・固有名詞辞書などを尋ねるセットアップ対話が
+入る（次回以降はスキップされる）。詳細は次の「初回セットアップ」を参照。
+
+## 初回セットアップ（チャンネル設定）
+
+このリポジトリには特定チャンネルの固有名詞・スタイル学習データは含まれない。
+`/srt-fast` を初めて実行したとき、`config/channel_profile.md` が無ければチャンネル名・
+目標文字数・固有名詞辞書・半角スペースの好みを質問し、回答を `config/channel_profile.md` と
+`config/corrections.local.json`（いずれも gitignore 対象・個人設定）に保存する。2回目以降は
+この設定を自動で使う。テンプレは `config/channel_profile.example.md` /
+`config/corrections.example.json`。手動で作りたい場合はこれらをコピーして値を埋めればよい。
+
 ## 動作環境
 
 - macOS / Linux (Premiere Pro 自体は別途必要)
@@ -53,7 +73,9 @@ brew install ffmpeg
 - `scripts/silence_cut.py` / `scripts/whisper_to_srt.py` / `scripts/transcribe_parallel.py` — 実装スクリプト
 - `scripts/chunk_tools/` — 並列転写・チャンク統合（/srt と /srt-fast が共用）
 - `references/srt_runtime_rules.md` — テロップ改行の実行時ルール正典
-- `memory/` — 日本語固有名詞辞書・SRT 切り分けルールの原典（履歴・根拠）
+- `memory/` — 日本語固有名詞辞書・SRT 切り分けルールの原典（履歴・根拠。配布時点では空テンプレ）
+- `config/` — チャンネル固有設定（`channel_profile.md` / `corrections.local.json`。gitignore対象・
+  セットアップ対話で自動生成。テンプレは `*.example.*`）
 - `output/` — 成果物保存場所 (publish 対象外推奨)
 
 詳細仕様は `commands/*.md` と `references/srt_runtime_rules.md` を参照。

@@ -49,222 +49,58 @@ MAX_GAP_FILL_MS = 1500  # これ以下のgapは前の字幕を延長して埋め
 SNAP_THRESHOLD_S = 0.200  # ±200ms以内のカット点にスナップ
 
 # 置換は長い文字列から先に適用される（部分一致の衝突を防ぐ）
+# ここは意図的に空。チャンネル固有の固有名詞・言い間違い修正は
+# config/corrections.local.json（gitignore対象）に書く。テンプレは
+# config/corrections.example.json、記入は /srt-fast Step 0 のセットアップ対話で行う。
+# 例: {"サンプル誤変換": "サンプル正規表記"} のような
+# 「Whisperの誤認識」→「正規表記」のペアを追記していく。
 CORRECTIONS: dict[str, str] = {
-    # ── AI製品名（複合語を先に） ──
-    # ClaudeCode（スペースなし表記）をチャンネルルールに採用 (2026-04-18)
-    "Claudeコード": "ClaudeCode",
-    "クロードコード": "ClaudeCode",
-    "Claude Code": "ClaudeCode",
-    "チャットジーピーティー": "ChatGPT",
-    "チャットGPT": "ChatGPT",
-    # ── 動画制作ツール（2026-04-18 追加） ──
-    "リノイズ": "Renoise",
-    "レノイズ": "Renoise",
-    "リモーション": "Remotion",
-    "レモーション": "Remotion",
-    # ── 画像生成AI（No.769で追加） ──
-    "ナノバナナ": "NanoBanana",   # ★ NanoBanana（Gemini画像生成ツール）13回/本
-    # ── 動画生成AI（No.769で追加） ──
-    "二次ジャーニー": "Midjourney",  # Midjourneyの誤変換（別形）
-    "ミッドジャーニー": "Midjourney",  # Midjourneyの誤変換
-    "シーダンス": "Seedance",     # Seedance動画生成AI
-    "ビデュー": "Vidu",           # Vidu動画生成AI
-    "クリング": "Kling",          # Kling動画生成AIの誤変換
-    # ── AIエージェント（No.769で追加） ──
-    "アンチグラビティ": "Antigravity",  # ★ Antigravity AIエージェント 4回/本
-    "ジェンスパーク": "Genspark",  # Genspark AIエージェント
-    "コデックス": "Codex",         # ChatGPT Codex
-    "コレックス": "Codex",         # ChatGPT Codex（別誤変換）
-    "コーデックス": "Codex",       # ChatGPT Codex（長音符付き誤変換・テスト動画で頻出）
-    "グロック": "Grok",            # ★ xAI Grok 11回/本
-    # 「フロー」→Flow は REGEX_CORRECTIONS へ移動（ワークフロー等の複合語を保護）
-    # ── 音楽生成AI ──
-    "エースミュージック": "Ace Music",  # ★ Ace Music（ローカル音楽生成） 13回/本
-    "群れ替えAI": "Mureka AI",    # ★ MurekaAI の誤変換（3回/本）
-    "ブレーカーAI": "Mureka AI",  # ★ MurekaAI の別誤変換（2回/本）
-    "フリービートAI": "FreeBeatAI",  # FreeBeatAI の誤変換（カタカナ→英字）
-    "Snow": "Suno",               # ★ Suno の英語表記誤変換（No.769で4回）
-    "スノー": "Suno",             # ★ Suno音楽生成AIの誤変換
-    "ユーディオ": "Udio",         # UdioのWhisper誤変換
-    "UDEO": "Udio",               # Udioの別誤変換
-    "リリア": "Lilia",            # Gemini LiliaのWhisper誤変換（5回/本）
-    # ── 動画・画像生成AI ──
-    "ベオ3": "Veo 3",             # Google Veo 3の誤変換
-    # ── クラウドサービス ──
-    "コパイロット": "Copilot",    # Microsoft Copilot
-    # ── Claudeモデル名 ──
-    "OPAS": "Opus",
-    "オーパス": "Opus",
-    "SONNET": "Sonnet",
-    "ソネット": "Sonnet",
-    "HAIKU": "Haiku",
-    "ハイク": "Haiku",
-    # ── AI製品名（単語） ──
-    "クロード": "Claude",
-    "ジェミニ": "Gemini",
-    "マナス": "Manus",
-    # 「ロバート」→Lovart は文脈依存（人名Robertを破壊）のため辞書から除外。
-    # LLM が lines.txt で文脈修正する（v6 は全体アライメントなので時刻はズレない）
-    # 「カーソル」→Cursor は REGEX_CORRECTIONS へ移動（マウスカーソル等を保護）
-    # ── チャンネル固有名詞 ──
-    # 2026-04-18: N1 はチャンネル表記「[COMPANY]」に統一
-    "エヌワン": "[COMPANY]",
-    "N1": "[COMPANY]",
-    "AI周期カラボ": "[CHANNEL]",    # ★ チャンネル名の誤変換
-    "AI収益化カラボ": "[CHANNEL]",  # ★ チャンネル名の別誤変換
-    "AICカラボ": "[CHANNEL]",       # ★ No.ClaudeCode × Renoise × Remotion で発生
-    "AI周囲カラボ": "[CHANNEL]",    # ★ No.ClaudeCode × Renoise × Remotion で発生
-    "AI主義カラボ": "[CHANNEL]",    # ★ No.ClaudeCode × Renoise × Remotion 後半で発生
-    "AICクラブ": "[CHANNEL]",       # ★ 別パターン
-    # ── [COMPANY]関連の追加誤認識（2026-04-18） ──
-    "NHAI副業大学": "[COMPANY]大学",
-    "NH AI副業大学": "[COMPANY]大学",
-    "NHがやってる": "[COMPANY]がやってる",
-    "n 1": "[COMPANY]",
-    # ── 動画生成・ツール追加（2026-04-18） ──
-    "SEEDANCE": "Seedance",
-    "Hike": "Haiku",
-    "Mid Journey": "Midjourney",
-    "Nano Banana": "NanoBanana",
-    "ビッグトック": "TikTok",
-    "ディスコード": "Discord",
-    "キャンバー": "Canva",
-    "フィグマ": "Figma",
-    # 同音異義語（文脈依存・完全一致のみ置換）
-    "精神をテーマに": "青春をテーマに",
-    "レイブに出されている": "ライブに出されている",
-    "他社に売る": "他者に売る",
-    # ── サービス名・ブランド名 ──
-    "ネットフリックス": "Netflix",
-    "ネトフリ": "Netflix",
-    "ジーピーティーズ": "GPTs",
-    "ジーピーティーエス": "GPTs",
-    # ── 口語→書き言葉（文字数削減） ──
-    "っていう": "という",          # 4字→3字（No.769ユーザー指示）
-    # ── Whisperの一般的な誤変換 ──
-    "該注": "外注",
-    "v側近性": "即金性",
-    # ── No.801 学習結果（2026-04-12、音声生成AI徹底比較） ──
-    # UIラベル・ボタン名（英語で統一）
-    "ジェネレーションコンプリーティットサクセスフリー": "Generation completed successfully",
-    "ジェネレイト": "Generate",
-    "サウンドタック": "Sound Tag",
-    "リリックス": "Lyrics",
-    "アングリー": "Angry",
-    # プロダクト名(半角スペース正規化)
-    "ミニマックスオーディオ": "MiniMax Audio",
-    "ミニマックス": "MiniMax",
-    "MiniMaxAudio": "MiniMax Audio",
-    "フィッシュオーディオ": "Fish Audio",
-    "FishAudio": "Fish Audio",
-    "イレブンラブス": "ElevenLabs",
-    "イレブンラボ": "ElevenLabs",
-    # 動画生成
-    "ハイローAI": "HailuoAI",
-    "ハイロー": "HailuoAI",
-    "QN3TTS": "Qwen3-TTS",
-    "クエン3TTS": "Qwen3-TTS",
-    # 機能名（長い UI 文字列）
-    "リムーブバックグラウンドノイズ": "Remove Background Noise",
-    "アドユアボイストゥザミックス": "Add Your Voice to the Mix",
-    # テキストツースピーチ（UI表記「Speach」を正とする）
-    "テキストトゥスピーチ": "Text-to-Speach",
-    "テキストツースピーチ": "Text-to-Speach",
-    "テキスト2スピーチ": "Text-to-Speach",
-    # 助詞補完
-    "確かに声似てる": "確かに声は似てる",
-    # 同音異義語修正（No.801）
-    "アフィリート": "アフィリエイト",
-    "ステディサトシ": "Steady Satoshi",
-    # ── No.822 学習結果（2026-04-25、中国の動画生成AIがレベチすぎる） ──
-    "ソラ": "Sora",
-    "ベオー3.1": "Veo 3.1",
-    "VEOS 3.1": "Veo 3.1",           # WhisperがVeo 3.1を英字誤認識
-    "ベオスリー": "Veo 3",
-    "ランメイ": "Runway",
-    "ランウェイ": "Runway",
-    "LANWARE": "Runway",              # WhisperがRunwayを英字誤認識
-    "ノーラン": "NoLang",
-    "NORAN": "NoLang",                # WhisperがNoLangを英字誤認識
-    "KlingAI": "Kling AI",
-    "ハイルオAI": "HailuoAI",
-    "ハイルオ": "HailuoAI",
-    # 「ハイル」→HailuoAI は REGEX_CORRECTIONS へ移動（カタカナ複合語を保護）
-    "ラブアート": "Lovart",
-    "1AI": "Wan",
-    "ワンAI": "Wan",                  # Wan（アリババ動画生成AI）のカタカナ誤認識
-    "Seedance2.0": "Seedance 2.0",
-    "SEA DANCE 2.0": "Seedance 2.0",
-    "Cダンス2.0": "Seedance 2.0",
-    "c ダンス2.0": "Seedance 2.0",    # 小文字＋スペースパターン
-    "c ダンス": "Seedance",           # No.829: "c ダンス を超える" パターン（2.0 なし）
-    # ── No.829 漫画NOW公式コラボ 新出誤認識（2026-05-03） ──
-    "漫画ナウ": "漫画NOW",            # 漫画NOWの誤認識（カタカナ）
-    "マンガナウ": "漫画NOW",          # 漫画NOWの別誤認識（カタカナ）
-    "ハッピー オース": "HappyHorse",  # HappyHorse（動画生成モデル）の誤認識
-    "GBTメージ": "GPT Image",         # GPT Imageの誤認識
-    "キャップカット": "CapCut",
-    "トップビューAI": "TopView AI",
-    "ドリーミナ": "Dreamina",
-    "ハッピーホース1.0": "HappyHorse 1.0",
-    "ハッピーホース": "HappyHorse",
-    "AI収益カラボ": "[CHANNEL]",   # テスト動画で発生した短縮誤認識
-    "AI主役カラーボ": "[CHANNEL]", # テスト動画で発生した別パターン
-    # 「岡山」→奥山 は REGEX_CORRECTIONS へ移動（岡山県/岡山市を保護）
-    "アーティフィカルアナリシスビデオアレナ": "Artificial Analysis Video Arena",
-    "アーティフィカルアナリシス": "Artificial Analysis",
-    "ビデュ": "Vidu",
-    "Claudeコワーク": "Claude Cowork",
-    "インスタグラム": "Instagram",
-    "公式ライン": "公式LINE",
-    "LINE登録者限定に": "LINE登録者限定で",
-    # ── No.17 ClaudeCode×動画編集 新出誤認識（2026-04-29） ──
-    "AI修理科ラボ": "[CHANNEL]",      # チャンネル名（「収益化」→「修理科」誤認識）
-    "AI修理コラボ": "[CHANNEL]",      # チャンネル名（別パターン）
-    "クロートコード": "ClaudeCode",       # ClaudeCode誤認識（ロードではなくロート）
-    "SONET": "Sonnet",                    # Sonnet（モデル名、シングルN誤認識）
-    # ── No.20 LINE登録マニュアル新出誤認識（2026-05-05） ──
-    "JMINI": "Gemini",                    # Gemini（Whisperが「JMINI」と誤認識）
-    "qr コード": "QRコード",              # QRコード（小文字+スペース表記を正規化）
-    " ok ": " OK ",                       # OK（小文字表記を正規化）
-    # ── ERABERU AI×動画編集 新出（2026-07-02） ──
-    "フェイブル5": "Fable 5",             # Claude新モデル名（半角スペース付き正規表記）
-    "フェイブル": "Fable",
-    "オープンAI": "OpenAI",
-    "AIかける動画編集": "AI×動画編集",    # 企画名の正規表記（「かける」=×）
-    # ── bench.wav v7 E2E 新出（2026-07-04） ──
-    "[NAME]": "[NAME]",               # オーナー名の誤変換（かわむらふうま）
-    "株式会社NH": "[COMPANY]",     # 社名（NH→[COMPANY]は既存パターンの社名前置き版）
+    # 口語→書き言葉（文字数削減。チャンネルによらず有効な汎用ルールのため既定で有効）
+    "っていう": "という",
 }
 
 # 文脈ガード付き置換（str.replace の全置換だと「ワークフロー→ワークFlow」のような
-# 複合語破壊が起きるエントリ。前後がカタカナ/長音でない単独出現のみ置換する）
+# 複合語破壊が起きる場合に使う。前後がカタカナ/長音でない単独出現のみ置換する）。
+# チャンネル固有の複合語保護ルールが必要な場合はここに直接追記する
+# （例: `(re.compile(r"(?<!{_KATA})フロー(?!{_KATA})"), "Flow")`）。
 _KATA = r"[ァ-ヺー]"
-REGEX_CORRECTIONS: list[tuple[re.Pattern, str]] = [
-    (re.compile(rf"(?<!{_KATA})フロー(?!{_KATA})"), "Flow"),      # ワークフロー/フローチャートは保護
-    (re.compile(rf"(?<!{_KATA})カーソル(?!{_KATA})"), "Cursor"),  # マウスカーソルは保護
-    (re.compile(rf"(?<!{_KATA})ハイル(?!{_KATA})"), "HailuoAI"),
-    (re.compile(r"岡山(?![県市駅])"), "奥山"),                     # 地名（岡山県/岡山市/岡山駅）は保護
-]
+REGEX_CORRECTIONS: list[tuple[re.Pattern, str]] = []
+
+
+def _load_local_corrections() -> None:
+    """config/corrections.local.json があれば CORRECTIONS にマージする（無ければ何もしない）"""
+    path = Path(__file__).resolve().parent.parent / "config" / "corrections.local.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if isinstance(data, dict):
+        CORRECTIONS.update({
+            str(k): str(v) for k, v in data.items() if not str(k).startswith("_")
+        })
+
+
+_load_local_corrections()
 
 # フィラー削除パターン（正規表現）
 # 否定先読み (?!...) で複合語の誤削除を防止
 FILLER_PATTERNS: list[str] = [
     # ── 明確なフィラー（誤検出リスク低） ──
     r'(?<!まあ)まあ(?!まあ)',          # 「まあまあ」（程度表現）は保護
-    # 「確かに」は削除しない: No.801 完成版で「確かに声は似てる」が残っており、
-    # CORRECTIONS の助詞補完エントリとも矛盾するため。相槌の単独「確かに」は
-    # LLM が lines.txt 生成時に文脈判断で削る
+    # 「確かに」は削除しない: 単独の相槌「確かに」も文脈次第で意味を持つため、
+    # 一律削除ではなく LLM が lines.txt 生成時に文脈判断で削る
     r'え[ーえっ]*と',                  # えっと、ええと、えーと
     # ── 複合語保護付きフィラー ──
-    # 「こう」「ちょっと」は No.801 学習で全削除禁止。完成版 V4 で残されているケースが多い
-    # （副詞的用法・強調）。LLM の Step 3e で文脈判断で個別削除する
-    # r'こう(?![いやしすなだでじゆ])',   # ← No.801: 全削除禁止（5回残存）
-    # r'ちょっと(?!した)',             # ← No.801: 全削除禁止（1回残存）
+    # 「こう」「ちょっと」は全削除禁止（副詞的用法・強調で意味を持つケースが多い）。
+    # LLM の Step 3e で文脈判断で個別削除する
+    # r'こう(?![いやしすなだでじゆ])',
+    # r'ちょっと(?!した)',
     r'もう(?![少一すい終])',            # もう少し、もう一度、もうすぐ等は保護
     r'はい(?![るっり])',               # はいる等は保護
-    # 「ね」は削除しない: 「〜ですね」「〜ですよね」等は共感・確認の意味があり
-    # チャンネルスタイルでは意図的に残される（No.770分析で確認）
+    # 「ね」は削除しない: 「〜ですね」「〜ですよね」等は共感・確認の意味を持ち、
+    # 削除しすぎると口調が硬くなるため意図的に残す
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -693,7 +529,7 @@ def estimate_offset_from_xml(xml_root: ET.Element, fps: float) -> float:
     # WAV がソース録画の場合、タイムライン頭に無音区間があれば first_start > 0
     # でその秒数だけ後ろにずれる。
     # 旧実装は「最初の start>0 の clip」を探していたが、隣接する 2 番目以降の
-    # クリップを誤って拾い、+2.8s 等の誤オフセットを生じていた（No.822 で発覚）。
+    # クリップを誤って拾い、誤オフセットを生じるケースがあった。
     if first_start > 0:
         print(f"オフセット算出: +{first_start:.3f}秒 "
               f"(タイムライン上の最初のオーディオ開始位置)")
@@ -1306,8 +1142,8 @@ def assemble_from_text(
             fps = xml_fps
 
     # Whisper 単語列（apply_corrections 適用済み）を flatten
-    # NOTE: Whisper の word は細切れ（例: "A","IC","カ","ラ","ボ"）なので
-    # apply_corrections を単語単位で掛けても「AICカラボ→[CHANNEL]」が発動しない。
+    # NOTE: Whisper の word は細切れ（例: 複数文字にまたがる辞書エントリの場合、
+    # 単語単位では部分一致しない）なので apply_corrections を単語単位で掛けても発動しない。
     # segment 単位で raw を連結して apply_corrections を試し、置換が発生した
     # segment は文字数が変わるので、seg 全体を seg.start〜seg.end で線形配分する。
     words: list[dict] = []

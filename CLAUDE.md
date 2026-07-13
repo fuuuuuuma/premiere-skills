@@ -15,7 +15,7 @@ Premiere Pro ベースの動画編集ワークフローを Claude Code スキル
 
 日本語テキスト処理で `fugashi` / `MeCab` / `Ginza` 等の形態素解析をメインの判定に使わない。これらは候補抽出の補助にのみ利用する。**最終的な意味判断は LLM が文脈を読んで行う**。
 
-**なぜ**: 2026-04-11 の No.801 SRT 生成で fugashi + Tier ルールを採用した結果、「思って / いるので」「検証して / いきたい」のような複合動詞句の分断が頻発。ルールベースは日本語の「て形+補助動詞」のような文脈依存パターンに追いつけない。
+**なぜ**: 過去に fugashi + Tier ルールを採用した結果、「思って / いるので」「検証して / いきたい」のような複合動詞句の分断が頻発。ルールベースは日本語の「て形+補助動詞」のような文脈依存パターンに追いつけない。
 
 詳細は `memory/feedback_srt_grouping_rules.md` を参照。
 
@@ -27,8 +27,8 @@ Premiere Pro ベースの動画編集ワークフローを Claude Code スキル
 
 **CORRECTIONS 辞書の扱い（v6 で緩和）**: 時刻割当は difflib 全体アライメントになったため、
 lines.txt 側の固有名詞修正が辞書に無くても累積タイムズレは発生しない。ただし
-**チャンネル内で再登場する固有名詞**は CORRECTIONS 辞書と `memory/telop_channel_patterns.md`
-に追記する（次回以降の転写品質向上のため）。一回限りの文脈誤認識は辞書に入れない。
+**チャンネル内で再登場する固有名詞**は `config/corrections.local.json` と
+`memory/telop_channel_patterns.md` に追記する（次回以降の転写品質向上のため）。一回限りの文脈誤認識は辞書に入れない。
 
 ### 3. 出力は必ず `output/` 配下に配置
 
@@ -55,4 +55,4 @@ symlink はされていない。**編集は必ずこのプロジェクトフォ�
 | ファイル | 内容 | 更新タイミング |
 |---|---|---|
 | `memory/feedback_srt_grouping_rules.md` | SRT 切り分けの絶対ルール・失敗例・正解例 | ユーザー指摘時、新しい失敗パターン発見時 |
-| `memory/telop_channel_patterns.md` | [CHANNEL]ch 固有の固有名詞辞書・スタイル | 新しい固有名詞・表記揺れ発見時 |
+| `memory/telop_channel_patterns.md` | チャンネル固有の固有名詞辞書・スタイル分析（原典） | 新しい固有名詞・表記揺れ発見時 |
