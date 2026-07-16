@@ -43,6 +43,103 @@ def resolve_file_path(clip, file_id_map):
     return None
 
 
+def build_file_video_dims(root):
+    """file id → (width, height)。pathurl付きの完全定義だけを対象にする
+    (グラフィック等の実体パスなしfileへ誤ってスケールを付けないため)。"""
+    dims = {}
+    for file_elem in root.iter('file'):
+        fid = file_elem.get('id')
+        if not fid or fid in dims:
+            continue
+        pathurl = file_elem.find('pathurl')
+        if pathurl is None or not pathurl.text:
+            continue
+        w = file_elem.findtext('./media/video/samplecharacteristics/width')
+        h = file_elem.findtext('./media/video/samplecharacteristics/height')
+        if not w or not h:
+            continue
+        try:
+            dims[fid] = (int(w), int(h))
+        except ValueError:
+            continue
+    return dims
+
+
+def clip_has_motion_filter(clip_elem):
+    """クリップに Basic Motion (手動スケール等の明示指定) が既にあるか。"""
+    for eff in clip_elem.findall('./filter/effect'):
+        if (eff.findtext('effectid') or '').strip() == 'basic':
+            return True
+        if (eff.findtext('name') or '').strip() == 'Basic Motion':
+            return True
+    return False
+
+
+def fit_scale_percent(file_w, file_h, seq_w, seq_h):
+    """素材全体がフレーム内へ収まるスケール% (Scale to Frame Size相当)。"""
+    return round(min(seq_w / file_w, seq_h / file_h) * 100, 4)
+
+
+def build_fit_scale_filter(scale_percent):
+    f = ET.Element('filter')
+    eff = ET.SubElement(f, 'effect')
+    ET.SubElement(eff, 'name').text = 'Basic Motion'
+    ET.SubElement(eff, 'effectid').text = 'basic'
+    ET.SubElement(eff, 'effectcategory').text = 'motion'
+    ET.SubElement(eff, 'effecttype').text = 'motion'
+    ET.SubElement(eff, 'mediatype').text = 'video'
+    p = ET.SubElement(eff, 'parameter')
+    p.set('authoringApp', 'PremierePro')
+    ET.SubElement(p, 'parameterid').text = 'scale'
+    ET.SubElement(p, 'name').text = 'Scale'
+    ET.SubElement(p, 'valuemin').text = '0'
+    ET.SubElement(p, 'valuemax').text = '1000'
+    ET.SubElement(p, 'value').text = str(scale_percent)
+    return f
+
+
+def insert_fit_scale_filters(sequence, root):
+    """解像度がシーケンスと異なりスケール指定を持たないビデオクリップへ、
+    フレームサイズに収まる Basic Motion Scale を付与する。
+
+    Premiereの「フレームサイズに合わせてスケール」フラグはFCP XMLに
+    書き出されないため、そのままimportすると素材が原寸(100%)で読み込まれ
+    「カット後に画面の大きさが変わる」ように見える。明示スケールを持つ
+    クリップ(手動スケール・キーフレーム)には触れない。
+    Returns: 挿入件数
+    """
+    fmt = sequence.find('.//media/video/format/samplecharacteristics')
+    if fmt is None:
+        return 0
+    try:
+        seq_w = int(fmt.findtext('width'))
+        seq_h = int(fmt.findtext('height'))
+    except (TypeError, ValueError):
+        return 0
+    if seq_w <= 0 or seq_h <= 0:
+        return 0
+    dims = build_file_video_dims(root)
+    video_elem = sequence.find('.//media/video')
+    if video_elem is None:
+        return 0
+    inserted = 0
+    for track_elem in video_elem.findall('track'):
+        for clip in track_elem.findall('clipitem'):
+            file_elem = clip.find('file')
+            if file_elem is None:
+                continue
+            wh = dims.get(file_elem.get('id'))
+            if not wh or wh == (seq_w, seq_h):
+                continue
+            if clip_has_motion_filter(clip):
+                continue
+            clip.append(build_fit_scale_filter(
+                fit_scale_percent(wh[0], wh[1], seq_w, seq_h)
+            ))
+            inserted += 1
+    return inserted
+
+
 def probe_media_fps_duration(path):
     """実メディアの実fpsと長さ(秒)をffprobeで取得。失敗時は(None, None)。
 
@@ -80,7 +177,7 @@ def probe_media_fps_duration(path):
 
 
 def detect_silence_envelope(audio_file, start_sec, duration_sec,
-                            threshold_db=-45, min_silence=0.2,
+                            threshold_db=-48, min_silence=0.2,
                             sr=16000, win_ms=20):
     """RMSエンベロープの閾値交差で無音区間を検出（前後対称化の根本対策）。
 
@@ -147,14 +244,16 @@ def main():
         help="出力ディレクトリ。指定時はこのディレクトリに '<basename>_カット済み.xml' を配置。"
              "推奨: $REPO_DIR/output/cut/",
     )
-    parser.add_argument("--threshold", type=float, default=-45,
+    parser.add_argument("--threshold", type=float, default=-48,
                         help="無音判定の閾値(dB)。小さい値ほど厳しく(=カット減)。ぶつぶつ喋りは -45〜-50 推奨")
     parser.add_argument("--min-silence", type=float, default=0.2,
                         help="無音と判定する最小秒数。大きくすると短い間(ま)を残す")
     parser.add_argument("--padding", type=int, default=2,
                         help="カット前後に残すパディングフレーム数")
-    parser.add_argument("--no-normalize-fps", action="store_true",
-                        help="XML宣言fpsと実素材fpsがズレていても出力rateを補正しない（既定は補正する）")
+    parser.add_argument("--no-fit-scale", action="store_true",
+                        help="素材解像度がシーケンスと異なるクリップへの自動フィット"
+                             "スケール付与を無効化 (「フレームサイズに合わせる」フラグは"
+                             "XMLに保存されないため、既定では自動付与して見た目を保つ)")
     args = parser.parse_args()
 
     input_xml = args.input_xml
@@ -222,6 +321,7 @@ def main():
     audio_elem = sequence.find('.//media/audio')
 
     tracks = []  # list of track dicts
+    probe_cache = {}  # 同一ファイルの複数クリップで ffprobe を繰り返さない（全フェーズで共有）
 
     track_label_idx = {'video': 0, 'audio': 0}
     for media_type, media_elem in [('video', video_elem), ('audio', audio_elem)]:
@@ -245,6 +345,17 @@ def main():
                 enabled = clip.find('enabled')
                 is_enabled = enabled is not None and enabled.text.upper() == 'TRUE'
 
+                # 実fps（ソース素材の物理フレームレート）。pproTicks（精密な実時間）の
+                # 計算にのみ使う。宣言timebaseとズレていると、新規生成クリップの
+                # pproTicksを宣言timebase基準で計算した際に実メディア終端を超え、
+                # Premiereがソース範囲外と判断して波形/映像を読み込めなくなる
+                # （末尾に近いクリップほどズレが蓄積し顕在化しやすい）。
+                real_fps = None
+                if filepath and os.path.exists(filepath):
+                    if filepath not in probe_cache:
+                        probe_cache[filepath] = probe_media_fps_duration(filepath)
+                    real_fps, _ = probe_cache[filepath]
+
                 clips.append({
                     'clip_elem': clip,
                     'in_frame': in_frame,
@@ -254,6 +365,7 @@ def main():
                     'offset': offset,
                     'filepath': filepath,
                     'enabled': is_enabled,
+                    'real_fps': real_fps,
                 })
                 fname = os.path.basename(filepath) if filepath else '?'
                 print(f"  {label}: {fname} | offset={offset} | in={in_frame} out={out_frame} | "
@@ -280,8 +392,7 @@ def main():
     tl_duration = tl_total_end - tl_total_start
 
     all_silence_tl_frames = []
-    a1_real_fps = None  # 正規化用：A1メイン素材の実fps
-    probe_cache = {}    # 同一ファイルの複数クリップで ffprobe を繰り返さない
+    a1_real_fps = None  # 情報表示用：A1メイン素材の実fps（probe_cacheはトラック収集フェーズと共有）
 
     for ci, a1_clip in enumerate(a1_track['clips']):
         audio_file = a1_clip['filepath']
@@ -364,30 +475,12 @@ def main():
     print(f"  結果: {tl_duration/timebase:.1f}s → {total_kept/timebase:.1f}s "
           f"({total_cut/tl_duration*100:.1f}%削減)")
 
-    # ── fps正規化 ──
-    # VFR素材などでXML宣言fps（例: 29）が実素材fps（例: 29.998）とズレている場合、
-    # 出力シーケンスのrateを実素材に最も近い標準fps（timebase+ntsc）へ揃える。
-    # フレーム番号は実体の連番なので変えず、rate表記とtick(時間)換算だけを補正する。
-    normalize = not args.no_normalize_fps
-    target_tb, target_ntsc = tb, ntsc
-    do_normalize = False
-    if normalize and a1_real_fps and abs(a1_real_fps - timebase) > 0.01:
-        nearest = max(1, round(a1_real_fps))
-        candidates = [
-            (nearest, False, float(nearest)),          # 例: 30.0
-            (nearest, True, nearest * 1000.0 / 1001.0),  # 例: 29.97
-        ]
-        target_tb, target_ntsc, _ = min(
-            candidates, key=lambda c: abs(c[2] - a1_real_fps))
-        do_normalize = (target_tb != tb) or (target_ntsc != ntsc)
-
-    if do_normalize:
-        effective_fps = target_tb * 1000.0 / 1001.0 if target_ntsc else float(target_tb)
-        ticks_per_frame = int(TICKS_PER_SECOND / effective_fps)
-        print(f"  fps正規化: 宣言 {timebase:.4f}fps → 出力 "
-              f"{effective_fps:.4f}fps (timebase={target_tb}, ntsc={'TRUE' if target_ntsc else 'FALSE'})")
-
     # ── XML再構築 ──
+    # rate（timebase/ntsc）は宣言値のまま変更しない。frame番号とtick換算の基準を
+    # 揃え続けるための決定。実fpsで出力rateを補正すると、旧timebase基準で計算した
+    # フレーム番号と新fps基準のticks_per_frameが食い違い、Premiere側で時間軸がズレる
+    # （実測: 220秒素材で数秒規模のドリフト、file要素のrateまで書き換わり同一ソースが
+    # 二重fpsで読み込まれる不具合を確認済み）。
     print(f"\n[4/4] XML再構築...")
 
     # 新タイムライン位置
@@ -477,10 +570,19 @@ def main():
                 if elem is not None:
                     elem.text = str(val)
 
+            # pproTicksは精密な実時間(tick)の表現で、宣言timebaseではなくソース
+            # 素材の実fpsを基準に計算する必要がある（元のXMLもそう計算されている）。
+            # 宣言timebase基準のticks_per_frameを流用すると、末尾に近いクリップほど
+            # ズレが蓄積し、実メディア終端を超えるpproTicksを書き込んでしまい、
+            # Premiereがソース範囲外と判断して波形/映像を読み込めなくなる。
+            real_fps = source_clip.get('real_fps')
             for tag, frame in [('pproTicksIn', src_in), ('pproTicksOut', src_out)]:
                 elem = new_clip.find(tag)
                 if elem is not None:
-                    elem.text = str(frame * ticks_per_frame)
+                    if real_fps:
+                        elem.text = str(round(frame * TICKS_PER_SECOND / real_fps))
+                    else:
+                        elem.text = str(frame * ticks_per_frame)
 
             # file参照: 同じfileIDは最初だけ詳細、以降は空参照
             file_elem = new_clip.find('file')
@@ -519,15 +621,42 @@ def main():
 
             track_elem.append(new_clip)
 
-    # fps正規化: 全 <rate> ブロックの timebase/ntsc を書き換え
-    if do_normalize:
-        for rate_elem in root.iter('rate'):
-            tbe = rate_elem.find('timebase')
-            ne = rate_elem.find('ntsc')
-            if tbe is not None:
-                tbe.text = str(target_tb)
-            if ne is not None:
-                ne.text = 'TRUE' if target_ntsc else 'FALSE'
+    # 解像度不一致クリップへのフィットスケール付与
+    # (「フレームサイズに合わせる」はXML非保存のため、明示スケールが無い
+    #  クリップはimport時に原寸へ戻り画面の大きさが変わって見える)
+    if not args.no_fit_scale:
+        fitted = insert_fit_scale_filters(sequence, root)
+        if fitted:
+            print(f"  解像度不一致のクリップ {fitted}件へフィットスケールを付与"
+                  f" (--no-fit-scale で無効化可)")
+
+    # キーフレーム付きエフェクトを分割した場合は見え方が変わる恐れを警告
+    # (キーフレームのリタイムは行わない — when座標系の仕様が実機未確定のため)
+    keyframed = set()
+    for track_idx, track_info in enumerate(tracks):
+        frag_counts = {}
+        for nc in new_clips_per_track[track_idx]:
+            key = id(nc['source_clip'])
+            frag_counts.setdefault(key, []).append(nc)
+        for clip_info in track_info['clips']:
+            frags = frag_counts.get(id(clip_info), [])
+            if not frags:
+                continue
+            untouched = (
+                len(frags) == 1
+                and frags[0]['old_tl_start'] == clip_info['tl_start']
+                and frags[0]['old_tl_end'] == clip_info['tl_end']
+            )
+            if untouched:
+                continue
+            if clip_info['clip_elem'].find('.//keyframe') is not None:
+                name = (clip_info['clip_elem'].findtext('name')
+                        or os.path.basename(clip_info['filepath'] or '?'))
+                keyframed.add(f"{track_info['label']}:{name}")
+    if keyframed:
+        print(f"  WARNING: キーフレーム付きエフェクトのクリップを分割しました: "
+              f"{', '.join(sorted(keyframed))} — カット後のモーション/スケールの"
+              f"見え方をPremiereで確認してください")
 
     # XML出力
     ET.indent(tree, space='\t')
