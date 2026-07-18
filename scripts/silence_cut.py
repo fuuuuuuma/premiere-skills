@@ -350,16 +350,14 @@ def main():
                 enabled = clip.find('enabled')
                 is_enabled = enabled is not None and enabled.text.upper() == 'TRUE'
 
-                # 実fps（ソース素材の物理フレームレート）。pproTicks（精密な実時間）の
-                # 計算にのみ使う。宣言timebaseとズレていると、新規生成クリップの
-                # pproTicksを宣言timebase基準で計算した際に実メディア終端を超え、
-                # Premiereがソース範囲外と判断して波形/映像を読み込めなくなる
-                # （末尾に近いクリップほどズレが蓄積し顕在化しやすい）。
+                # 実メディアの実fpsと実長。pproTicksの「実メディア終端を超えない」
+                # クランプ判定にのみ使う (換算基準には使わない — 下のpproTicks節参照)。
                 real_fps = None
+                media_dur = None
                 if filepath and os.path.exists(filepath):
                     if filepath not in probe_cache:
                         probe_cache[filepath] = probe_media_fps_duration(filepath)
-                    real_fps, _ = probe_cache[filepath]
+                    real_fps, media_dur = probe_cache[filepath]
 
                 clips.append({
                     'clip_elem': clip,
@@ -371,6 +369,7 @@ def main():
                     'filepath': filepath,
                     'enabled': is_enabled,
                     'real_fps': real_fps,
+                    'media_dur': media_dur,
                 })
                 fname = os.path.basename(filepath) if filepath else '?'
                 print(f"  {label}: {fname} | offset={offset} | in={in_frame} out={out_frame} | "
@@ -575,19 +574,21 @@ def main():
                 if elem is not None:
                     elem.text = str(val)
 
-            # pproTicksは精密な実時間(tick)の表現で、宣言timebaseではなくソース
-            # 素材の実fpsを基準に計算する必要がある（元のXMLもそう計算されている）。
-            # 宣言timebase基準のticks_per_frameを流用すると、末尾に近いクリップほど
-            # ズレが蓄積し、実メディア終端を超えるpproTicksを書き込んでしまい、
-            # Premiereがソース範囲外と判断して波形/映像を読み込めなくなる。
-            real_fps = source_clip.get('real_fps')
+            # pproTicksはフレーム値と「同一基準 (宣言timebase)」で書く。
+            # 旧実装は実fps基準で書いており、フレーム値 (宣言基準) との差が
+            # クリップ位置に比例して開く: 宣言10 vs 実10.06の画面収録 (2026-07-18
+            # 実測) では終盤で約14秒ズレ、Premiereがticksを優先してカット崩壊。
+            # 差0.1%級 (30 vs 29.998) では見えなかっただけで基準混在が誤り。
+            # 実fps/実長は「実メディア終端を超えない」クランプにのみ使う
+            # (2026-06の波形読み込み不能の教訓はクランプで担保する)。
+            media_dur = source_clip.get('media_dur')
             for tag, frame in [('pproTicksIn', src_in), ('pproTicksOut', src_out)]:
                 elem = new_clip.find(tag)
                 if elem is not None:
-                    if real_fps:
-                        elem.text = str(round(frame * TICKS_PER_SECOND / real_fps))
-                    else:
-                        elem.text = str(frame * ticks_per_frame)
+                    seconds = frame / timebase
+                    if media_dur and seconds > media_dur:
+                        seconds = media_dur
+                    elem.text = str(round(seconds * TICKS_PER_SECOND))
 
             # file参照: 同じfileIDは最初だけ詳細、以降は空参照
             file_elem = new_clip.find('file')
