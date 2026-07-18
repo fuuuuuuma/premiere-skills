@@ -297,7 +297,12 @@ def main():
         print(f"  WARNING: <sequence>が{len(sequences)}個あります。"
               f"clipitem最多の '{name}' を編集対象に選択")
 
-    rate_elem = sequence.find('.//rate')
+    # シーケンス直下の<rate>を最優先で読む。'.//rate' の文書順先頭は、実XMLの
+    # 形によっては<timecode>やクリップ側のrateを掴み、非30fpsでの全カット位置
+    # ズレ (30fps前提に見える壊れ方) の温床になる。
+    rate_elem = sequence.find('rate')
+    if rate_elem is None or rate_elem.find('timebase') is None:
+        rate_elem = sequence.find('.//rate')
     tb = int(rate_elem.find('timebase').text)
     ntsc = rate_elem.find('ntsc').text.upper() == 'TRUE'
     timebase = tb * 1000 / 1001 if ntsc else tb
