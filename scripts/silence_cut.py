@@ -172,7 +172,7 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
     """書き出しXMLの宣言レートがPremiereの報告する実レートと違うとき、出力全体を
     実レートのグリッドへ一貫して張り替える。
 
-    背景 (実機・IMG_4079.MOV): 素材は29.998fps (名目30fps)。Premiereは画面に
+    背景 (実機): iPhone等の素材は29.998fps (名目30fps)。Premiereは画面に
     「30.00」と出すが、FCP XML書き出し時に29.998を切り捨てて timebase=29 と書く。
     シーケンスもクリップも <rate>=29。silence_cut はこの29でタイムライン位置・
     素材in/out・pproTicksを計算するため、Premiereが実素材(30fps)で取り込むと
