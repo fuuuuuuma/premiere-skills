@@ -5,6 +5,7 @@ A1音声ベースの無音カット - 全トラック同期編集点
 A1の各クリップの音声で無音検出し、全トラックに同じタイムライン位置で編集点を入れる。
 """
 
+import re
 import xml.etree.ElementTree as ET
 import subprocess
 import copy
@@ -12,6 +13,10 @@ import os
 import sys
 import numpy as np
 from urllib.parse import unquote, urlparse
+
+
+# Premiereのタイムベース非依存の絶対時間単位 (1秒あたりのtick数)。
+TICKS_PER_SECOND = 254016000000
 
 
 def pathurl_to_filepath(pathurl):
@@ -164,15 +169,25 @@ def clip_declared_fps(clip_elem, seq_timebase, seq_ntsc):
 
 def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
                           true_tb, true_ntsc):
-    """出力シーケンスを「Premiereが報告する真のレート」で書き直す。
+    """書き出しXMLの宣言レートがPremiereの報告する実レートと違うとき、出力全体を
+    実レートのグリッドへ一貫して張り替える。
 
-    書き出しXMLの<rate>宣言が実シーケンスと食い違うと、取り込んだカット結果が
-    別のフレームレートのシーケンスになる (30fps→29fps等)。XMEMLでは
-    <start>/<end> は宣言レートのグリッド上の値なので、宣言を書き換えるだけでは
-    再生速度が変わってしまう。時刻(秒)を保ったままグリッドを張り替える。
+    背景 (実機・IMG_4079.MOV): 素材は29.998fps (名目30fps)。Premiereは画面に
+    「30.00」と出すが、FCP XML書き出し時に29.998を切り捨てて timebase=29 と書く。
+    シーケンスもクリップも <rate>=29。silence_cut はこの29でタイムライン位置・
+    素材in/out・pproTicksを計算するため、Premiereが実素材(30fps)で取り込むと
+    「pproTicksが指す実時間 × 実fps」と in/out(29基準) がズレ、素材に同期ズレの
+    赤バッジ (+17/+18…) が出る。
 
-    <in>/<out> はクリップ自身のレート基準、pproTicksは絶対時間なので触らない。
-    宣言と実レートが一致していれば何もしない (通常ケースは完全な無変更)。
+    そこで宣言レート全体 (start/end/in/out・全<rate>宣言・pproTicks) を true rate
+    へ揃える。フレーム値は時刻を保ったまま scale 倍し、<rate>宣言を書き換え、
+    pproTicksは張り替え後のin/outと true rate で再計算する (フレームと同一基準に
+    保つ = バッジが消える)。素材の<duration> (実フレーム数) は実体の性質なので
+    触らない。宣言と実レートが一致していれば完全な無変更。
+
+    注: 全クリップが同じ切り捨てを受けている前提 (シーケンス自体が切り捨てられた
+    ときだけ発動)。真に別レートのクリップが混在する編集では、そのクリップも
+    シーケンスレートへ寄せる (このワークフローの素材は単一カメラのため実害なし)。
     """
     declared_fps = declared_tb * 1000 / 1001 if declared_ntsc else float(declared_tb)
     true_fps = true_tb * 1000 / 1001 if true_ntsc else float(true_tb)
@@ -182,43 +197,52 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
     scale = true_fps / declared_fps
     print(f"  WARNING: 書き出しXMLの宣言レート {declared_fps:.4f}fps が"
           f" Premiereの報告する {true_fps:.4f}fps と違います"
-          f" → 出力を {true_fps:.4f}fps へ揃えます (タイムライン位置は時刻を保持)")
+          f" → 出力全体を {true_fps:.4f}fps へ揃えます (時刻は保持・同期ズレ防止)")
 
-    # タイムライン位置 (シーケンスグリッド上の値) を張り替える
-    for tag in ('start', 'end'):
+    def _rescale_frame(text):
+        try:
+            value = int((text or '').strip())
+        except ValueError:
+            return None
+        # -1 はトランジション用の番兵値。そのまま残す
+        return value if value < 0 else int(round(value * scale))
+
+    # タイムライン位置(start/end)と素材位置(in/out)を同一グリッドへ張り替える。
+    # in/out も29基準で書かれているため、ここを揃えないと素材の掴み位置がズレる。
+    for tag in ('start', 'end', 'in', 'out'):
         for elem in sequence.iter(tag):
-            text = (elem.text or '').strip()
-            if not text:
-                continue
-            try:
-                value = int(text)
-            except ValueError:
-                continue
-            # -1 はトランジション用の番兵値。そのまま残す
-            elem.text = str(value if value < 0 else int(round(value * scale)))
+            rescaled = _rescale_frame(elem.text)
+            if rescaled is not None:
+                elem.text = str(rescaled)
 
     duration_elem = sequence.find('duration')
     if duration_elem is not None and (duration_elem.text or '').strip().isdigit():
         duration_elem.text = str(int(round(int(duration_elem.text) * scale)))
 
-    # シーケンス自身を説明するrate宣言だけを差し替える
-    # (clipitem/file のrateは素材の性質なので触らない)
-    targets = [sequence.find('rate')]
-    timecode = sequence.find('timecode')
-    if timecode is not None:
-        targets.append(timecode.find('rate'))
-    video_format = sequence.find('./media/video/format/samplecharacteristics')
-    if video_format is not None:
-        targets.append(video_format.find('rate'))
-    for rate_elem in targets:
-        if rate_elem is None:
-            continue
+    # 全ての<rate>宣言 (シーケンス/クリップ/ファイル/タイムコード) を true へ。
+    # クリップのrateが29のままだとPremiereがpproTicks×実fpsと突き合わせて
+    # 同期ズレと判定する。
+    for rate_elem in sequence.iter('rate'):
         tb_elem = rate_elem.find('timebase')
         if tb_elem is not None:
             tb_elem.text = str(true_tb)
         ntsc_elem = rate_elem.find('ntsc')
         if ntsc_elem is not None:
             ntsc_elem.text = 'TRUE' if true_ntsc else 'FALSE'
+
+    # pproTicksを張り替え後のin/outとtrue rateで再計算し、フレームと同一基準に保つ。
+    for clip in sequence.iter('clipitem'):
+        for frame_tag, ticks_tag in (('in', 'pproTicksIn'), ('out', 'pproTicksOut')):
+            frame_elem = clip.find(frame_tag)
+            ticks_elem = clip.find(ticks_tag)
+            if frame_elem is None or ticks_elem is None:
+                continue
+            try:
+                frame = int((frame_elem.text or '').strip())
+            except ValueError:
+                continue
+            if frame >= 0:
+                ticks_elem.text = str(round(frame / true_fps * TICKS_PER_SECOND))
     return True
 
 
@@ -360,7 +384,6 @@ def main():
     THRESHOLD_DB = args.threshold
     MIN_SILENCE = args.min_silence
     PADDING_FRAMES = args.padding
-    TICKS_PER_SECOND = 254016000000
 
     print("=" * 60)
     print("A1音声ベース 無音カット（全トラック同期）")
