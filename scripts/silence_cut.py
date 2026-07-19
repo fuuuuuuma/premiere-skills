@@ -162,6 +162,66 @@ def clip_declared_fps(clip_elem, seq_timebase, seq_ntsc):
     return tb * 1000 / 1001 if ntsc else float(tb)
 
 
+def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
+                          true_tb, true_ntsc):
+    """出力シーケンスを「Premiereが報告する真のレート」で書き直す。
+
+    書き出しXMLの<rate>宣言が実シーケンスと食い違うと、取り込んだカット結果が
+    別のフレームレートのシーケンスになる (30fps→29fps等)。XMEMLでは
+    <start>/<end> は宣言レートのグリッド上の値なので、宣言を書き換えるだけでは
+    再生速度が変わってしまう。時刻(秒)を保ったままグリッドを張り替える。
+
+    <in>/<out> はクリップ自身のレート基準、pproTicksは絶対時間なので触らない。
+    宣言と実レートが一致していれば何もしない (通常ケースは完全な無変更)。
+    """
+    declared_fps = declared_tb * 1000 / 1001 if declared_ntsc else float(declared_tb)
+    true_fps = true_tb * 1000 / 1001 if true_ntsc else float(true_tb)
+    if abs(declared_fps - true_fps) < 1e-9:
+        return False
+
+    scale = true_fps / declared_fps
+    print(f"  WARNING: 書き出しXMLの宣言レート {declared_fps:.4f}fps が"
+          f" Premiereの報告する {true_fps:.4f}fps と違います"
+          f" → 出力を {true_fps:.4f}fps へ揃えます (タイムライン位置は時刻を保持)")
+
+    # タイムライン位置 (シーケンスグリッド上の値) を張り替える
+    for tag in ('start', 'end'):
+        for elem in sequence.iter(tag):
+            text = (elem.text or '').strip()
+            if not text:
+                continue
+            try:
+                value = int(text)
+            except ValueError:
+                continue
+            # -1 はトランジション用の番兵値。そのまま残す
+            elem.text = str(value if value < 0 else int(round(value * scale)))
+
+    duration_elem = sequence.find('duration')
+    if duration_elem is not None and (duration_elem.text or '').strip().isdigit():
+        duration_elem.text = str(int(round(int(duration_elem.text) * scale)))
+
+    # シーケンス自身を説明するrate宣言だけを差し替える
+    # (clipitem/file のrateは素材の性質なので触らない)
+    targets = [sequence.find('rate')]
+    timecode = sequence.find('timecode')
+    if timecode is not None:
+        targets.append(timecode.find('rate'))
+    video_format = sequence.find('./media/video/format/samplecharacteristics')
+    if video_format is not None:
+        targets.append(video_format.find('rate'))
+    for rate_elem in targets:
+        if rate_elem is None:
+            continue
+        tb_elem = rate_elem.find('timebase')
+        if tb_elem is not None:
+            tb_elem.text = str(true_tb)
+        ntsc_elem = rate_elem.find('ntsc')
+        if ntsc_elem is not None:
+            ntsc_elem.text = 'TRUE' if true_ntsc else 'FALSE'
+    return True
+
+
 def probe_media_fps_duration(path):
     """実メディアの実fpsと長さ(秒)をffprobeで取得。失敗時は(None, None)。
 
@@ -272,6 +332,13 @@ def main():
                         help="無音と判定する最小秒数。大きくすると短い間(ま)を残す")
     parser.add_argument("--padding", type=int, default=2,
                         help="カット前後に残すパディングフレーム数")
+    parser.add_argument("--sequence-timebase", type=int, default=None,
+                        help="Premiereが報告するシーケンスの真のtimebase。書き出しXMLの"
+                             "宣言値と食い違う場合、出力はこちらの値で書き直す"
+                             "（30fpsで受けたシーケンスを30fpsで返すための保険）")
+    parser.add_argument("--sequence-ntsc", default=None,
+                        choices=["TRUE", "FALSE", "true", "false"],
+                        help="--sequence-timebase と対で使うNTSCフラグ")
     parser.add_argument("--no-fit-scale", action="store_true",
                         help="素材解像度がシーケンスと異なるクリップへの自動フィット"
                              "スケール付与を無効化 (「フレームサイズに合わせる」フラグは"
@@ -714,6 +781,16 @@ def main():
         print(f"  WARNING: キーフレーム付きエフェクトのクリップを分割しました: "
               f"{', '.join(sorted(keyframed))} — カット後のモーション/スケールの"
               f"見え方をPremiereで確認してください")
+
+    # 宣言レートがPremiereの報告する実シーケンスレートと違う場合、出力を
+    # 実レートで書き直す。「30fpsのシーケンスをカットしたら29fpsで返ってきた」
+    # を防ぐための最終保証 (2026-07-20 実機報告)。
+    if args.sequence_timebase:
+        conform_sequence_rate(
+            tree, sequence, declared_tb=tb, declared_ntsc=ntsc,
+            true_tb=args.sequence_timebase,
+            true_ntsc=(args.sequence_ntsc or "FALSE").upper() == "TRUE",
+        )
 
     # XML出力
     ET.indent(tree, space='\t')
