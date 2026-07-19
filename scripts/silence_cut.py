@@ -140,6 +140,28 @@ def insert_fit_scale_filters(sequence, root):
     return inserted
 
 
+def clip_declared_fps(clip_elem, seq_timebase, seq_ntsc):
+    """clipitem自身が宣言する実効fpsを返す（<rate>が無ければシーケンス値を継承）。
+
+    XMEMLでは <start>/<end> がシーケンスrate単位、<in>/<out> はクリップ自身の
+    rate単位で書かれる。29.97素材を30fpsシーケンスへ置いた場合など両者が食い違う
+    プロジェクトでは、この2つを同じ単位として足し引きすると素材の掴み位置が
+    タイムライン位置に比例してズレる。
+    """
+    rate = clip_elem.find('rate')
+    tb, ntsc = seq_timebase, seq_ntsc
+    if rate is not None:
+        tb_elem = rate.find('timebase')
+        if tb_elem is not None and tb_elem.text:
+            tb = int(tb_elem.text)
+        ntsc_elem = rate.find('ntsc')
+        if ntsc_elem is not None and ntsc_elem.text:
+            ntsc = ntsc_elem.text.strip().upper() == 'TRUE'
+    if tb <= 0:
+        return None
+    return tb * 1000 / 1001 if ntsc else float(tb)
+
+
 def probe_media_fps_duration(path):
     """実メディアの実fpsと長さ(秒)をffprobeで取得。失敗時は(None, None)。
 
@@ -345,7 +367,14 @@ def main():
                 out_frame = int(clip.find('out').text)
                 tl_start = int(clip.find('start').text)
                 tl_end = int(clip.find('end').text)
+                # in/out はクリップ自身のrate単位。シーケンスrateとの比を掛けて
+                # 「タイムライン移動量→素材フレーム移動量」に換算する
+                # (同一rateなら比=1.0で従来と完全に同じ値になる)。
+                clip_fps = clip_declared_fps(clip, tb, ntsc) or timebase
+                src_per_tl = clip_fps / timebase
                 offset = in_frame - max(0, tl_start)
+                # 素材内の開始時刻(秒)。無音検出はこの実時間軸で行う。
+                in_sec = in_frame / clip_fps
                 filepath = resolve_file_path(clip, file_id_map)
                 enabled = clip.find('enabled')
                 is_enabled = enabled is not None and enabled.text.upper() == 'TRUE'
@@ -366,11 +395,17 @@ def main():
                     'tl_start': tl_start,
                     'tl_end': tl_end,
                     'offset': offset,
+                    'clip_fps': clip_fps,
+                    'src_per_tl': src_per_tl,
+                    'in_sec': in_sec,
                     'filepath': filepath,
                     'enabled': is_enabled,
                     'real_fps': real_fps,
                     'media_dur': media_dur,
                 })
+                if abs(src_per_tl - 1.0) > 1e-9:
+                    print(f"    レート混在: クリップ宣言{clip_fps:.4f}fps / "
+                          f"シーケンス{timebase:.4f}fps → in/outはクリップrate基準で換算")
                 fname = os.path.basename(filepath) if filepath else '?'
                 print(f"  {label}: {fname} | offset={offset} | in={in_frame} out={out_frame} | "
                       f"tl=[{tl_start},{tl_end}] | enabled={is_enabled}")
@@ -415,8 +450,10 @@ def main():
         real_fps, media_dur = probe_cache[audio_file]
         if a1_real_fps is None and real_fps:
             a1_real_fps = real_fps
-        in_sec = a1_clip['in_frame'] / timebase
-        dur_sec = (a1_clip['out_frame'] - a1_clip['in_frame']) / timebase
+        # in/out はクリップ自身のrate単位なので、素材内の時刻もそのrateで割る
+        clip_fps = a1_clip.get('clip_fps') or timebase
+        in_sec = a1_clip['in_sec']
+        dur_sec = (a1_clip['out_frame'] - a1_clip['in_frame']) / clip_fps
         # 解析窓を実メディア長でクランプ（窓が実体を超過して末尾を取りこぼすのを防ぐ安全網）
         if media_dur is not None:
             max_dur = media_dur - in_sec
@@ -434,12 +471,17 @@ def main():
             audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
         print(f"    検出無音: {len(silences)}箇所")
 
-        # 検出秒（実音声時間）→ タイムライン/ソースのフレーム番号（宣言timebase基準）
+        # 検出秒（素材内の実時間）→ タイムラインframe。
+        # 素材内の経過時間 (s - in_sec) をシーケンスtimebaseで刻み、クリップの
+        # タイムライン開始位置へ足す。素材側の単位 (clip_fps) はin_secに畳んで
+        # あるため、ここは常にシーケンス基準の整数フレームになる。
         for s_start, s_end in silences:
-            sf_start = int(round(s_start * timebase))
-            sf_end = int(round(s_end * timebase))
-            tf_start = max(sf_start - a1_clip['offset'], a1_clip['tl_start'])
-            tf_end = min(sf_end - a1_clip['offset'], a1_clip['tl_end'])
+            tf_start = max(
+                a1_clip['tl_start'] + int(round((s_start - in_sec) * timebase)),
+                a1_clip['tl_start'])
+            tf_end = min(
+                a1_clip['tl_start'] + int(round((s_end - in_sec) * timebase)),
+                a1_clip['tl_end'])
             if tf_end - tf_start >= min_silence_frames:
                 all_silence_tl_frames.append((tf_start, tf_end))
 
@@ -564,9 +606,15 @@ def main():
             new_clip_id = new_id_map[(track_idx, sub_idx)]
             new_clip.set('id', new_clip_id)
 
-            offset = source_clip['offset']
-            src_in = nc['old_tl_start'] + offset
-            src_out = nc['old_tl_end'] + offset
+            # タイムライン移動量はクリップ自身のrateへ換算してから素材in点へ足す。
+            # 同一rate (src_per_tl=1.0) なら従来の "old_tl + offset" と同じ整数値。
+            src_per_tl = source_clip.get('src_per_tl', 1.0)
+            tl_origin = source_clip['tl_start']
+            src_origin = source_clip['in_frame']
+            src_in = int(round(
+                (nc['old_tl_start'] - tl_origin) * src_per_tl + src_origin))
+            src_out = int(round(
+                (nc['old_tl_end'] - tl_origin) * src_per_tl + src_origin))
 
             for tag, val in [('in', src_in), ('out', src_out),
                              ('start', nc['new_tl_start']), ('end', nc['new_tl_end'])]:
@@ -582,10 +630,13 @@ def main():
             # 実fps/実長は「実メディア終端を超えない」クランプにのみ使う
             # (2026-06の波形読み込み不能の教訓はクランプで担保する)。
             media_dur = source_clip.get('media_dur')
+            # 素材内の絶対時刻はクリップ自身のrateで割る。in/outと同じ基準に
+            # 揃わないとPremiereがticks優先で読んだときに素材位置がズレる。
+            src_frame_fps = source_clip.get('clip_fps') or timebase
             for tag, frame in [('pproTicksIn', src_in), ('pproTicksOut', src_out)]:
                 elem = new_clip.find(tag)
                 if elem is not None:
-                    seconds = frame / timebase
+                    seconds = frame / src_frame_fps
                     if media_dur and seconds > media_dur:
                         seconds = media_dur
                     elem.text = str(round(seconds * TICKS_PER_SECOND))
