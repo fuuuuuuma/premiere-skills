@@ -18,6 +18,15 @@ from urllib.parse import unquote, urlparse
 # Premiereのタイムベース非依存の絶対時間単位 (1秒あたりのtick数)。
 TICKS_PER_SECOND = 254016000000
 
+# conform_sequence_rate が「宣言レートの丸め誤差」として許容する最大の相対差。
+# 実際に確認済みの切り捨てケース (30↔29.97/29, 60↔59.94/59, 24↔23.976/23) は
+# いずれも4%以内。これを大きく超える差 (例: 30↔60の50%) は「Premiereの丸め」
+# ではなく「呼び出し元が渡したtrue_tbそのものが誤検出」である可能性が高い
+# (2026-07-24 実機報告: パネルのフレームレート検出バグで常にtrue_tb=30が送られ、
+# 60fpsの正しいXMLを30fpsへ誤って張り替えて壊していた)。この閾値を超えたら
+# 張り替えを拒否し、宣言をそのまま残す (盲目的に信用しない安全網)。
+MAX_PLAUSIBLE_CONFORM_DEVIATION = 0.08
+
 
 def pathurl_to_filepath(pathurl):
     parsed = urlparse(pathurl)
@@ -188,6 +197,10 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
     注: 全クリップが同じ切り捨てを受けている前提 (シーケンス自体が切り捨てられた
     ときだけ発動)。真に別レートのクリップが混在する編集では、そのクリップも
     シーケンスレートへ寄せる (このワークフローの素材は単一カメラのため実害なし)。
+
+    安全網 (2026-07-24): true_tb/true_ntsc が宣言レートと大きくかけ離れている
+    (MAX_PLAUSIBLE_CONFORM_DEVIATION超) 場合は張り替えを拒否する。呼び出し元の
+    検出バグが疑わしいときに、正しい宣言を盲目的に壊さないための最終防御。
     """
     declared_fps = declared_tb * 1000 / 1001 if declared_ntsc else float(declared_tb)
     true_fps = true_tb * 1000 / 1001 if true_ntsc else float(true_tb)
@@ -195,6 +208,13 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
         return False
 
     scale = true_fps / declared_fps
+    if abs(scale - 1.0) > MAX_PLAUSIBLE_CONFORM_DEVIATION:
+        print(f"  WARNING: 指定されたシーケンスの実レート {true_fps:.4f}fps が"
+              f" 書き出しXMLの宣言 {declared_fps:.4f}fps と{abs(scale - 1.0) * 100:.0f}%"
+              "もかけ離れているため、張り替えを行いません"
+              " (通常の丸め誤差にはあり得ない差 — 呼び出し元の検出結果を疑い、"
+              "XML自身の宣言を優先します)")
+        return False
     print(f"  WARNING: 書き出しXMLの宣言レート {declared_fps:.4f}fps が"
           f" Premiereの報告する {true_fps:.4f}fps と違います"
           f" → 出力全体を {true_fps:.4f}fps へ揃えます (時刻は保持・同期ズレ防止)")
@@ -207,13 +227,37 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
         # -1 はトランジション用の番兵値。そのまま残す
         return value if value < 0 else int(round(value * scale))
 
-    # タイムライン位置(start/end)と素材位置(in/out)を同一グリッドへ張り替える。
-    # in/out も29基準で書かれているため、ここを揃えないと素材の掴み位置がズレる。
-    for tag in ('start', 'end', 'in', 'out'):
+    # タイムライン位置(start/end)を張り替える (独立丸め=同一フレーム値は常に同じ
+    # 結果になるため、隣接クリップの端同士が接している関係は保たれる)。
+    for tag in ('start', 'end'):
         for elem in sequence.iter(tag):
             rescaled = _rescale_frame(elem.text)
             if rescaled is not None:
                 elem.text = str(rescaled)
+
+    # 素材位置(in/out)はクリップ単位で「区間の長さ」を保存して張り替える。
+    # start/endと同じ独立丸めをin/outにも適用すると、speed=100%のクリップで
+    # (end-start)と(out-in)が本来一致するはずなのに丸め誤差で最大2フレーム
+    # ずれ、SRT側の速度変更判定を誤爆させる (2026-07-24 実機報告の残存分)。
+    # in を四捨五入した位置を基準に、out は in + round(区間長×scale) とし、
+    # 区間長の丸めを1回だけにする (in/outは常に同一クリップ内の値でしか
+    # 使われないため、タイムライン側のような隣接一致の制約は無い)。
+    for elem in sequence.iter():
+        in_elem = elem.find('in')
+        out_elem = elem.find('out')
+        if in_elem is None or out_elem is None:
+            continue
+        try:
+            in_value = int((in_elem.text or '').strip())
+            out_value = int((out_elem.text or '').strip())
+        except ValueError:
+            continue
+        if in_value < 0 or out_value < 0:
+            continue  # 番兵値等はそのまま (通常のclipitemでは発生しない)
+        new_in = int(round(in_value * scale))
+        new_out = new_in + int(round((out_value - in_value) * scale))
+        in_elem.text = str(new_in)
+        out_elem.text = str(new_out)
 
     duration_elem = sequence.find('duration')
     if duration_elem is not None and (duration_elem.text or '').strip().isdigit():
