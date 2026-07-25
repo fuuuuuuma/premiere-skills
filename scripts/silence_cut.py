@@ -5,6 +5,7 @@ A1音声ベースの無音カット - 全トラック同期編集点
 A1の各クリップの音声で無音検出し、全トラックに同じタイムライン位置で編集点を入れる。
 """
 
+import math
 import re
 import xml.etree.ElementTree as ET
 import subprocess
@@ -14,9 +15,28 @@ import sys
 import numpy as np
 from urllib.parse import unquote, urlparse
 
-
 # Premiereのタイムベース非依存の絶対時間単位 (1秒あたりのtick数)。
 TICKS_PER_SECOND = 254016000000
+
+# 終了コード (呼び出し元が原因で分岐できるようにする。1=汎用エラー・2=argparse)
+EXIT_NO_CUT = 3          # 無音・カット区間が1つも無い (成功扱いにしない)
+EXIT_AUDIO_FAILED = 4    # 基準トラックの音声を1クリップも解析できなかった
+
+
+class AudioAnalysisError(RuntimeError):
+    """音声の抽出・解析に失敗した。**無音0箇所として続行してはいけない**。
+
+    2026-07-25 視聴者報告「新しいシーケンスはできるが中身が未カットのまま」の
+    再現で確定した経路の1つ。ffmpegが失敗しても戻り値を検査せずに空のPCMを
+    「無音なし」と解釈していたため、カット0件のXMLが正常出力として公開されていた。
+    """
+
+
+def _db(amplitude, full_scale=32768.0):
+    """int16フルスケール基準の dBFS。0以下は None (無音そのもの)。"""
+    if amplitude is None or amplitude <= 0:
+        return None
+    return 20.0 * math.log10(amplitude / full_scale)
 
 # conform_sequence_rate が「宣言レートの丸め誤差」として許容する最大の相対差。
 # 実際に確認済みの切り捨てケース (30↔29.97/29, 60↔59.94/59, 24↔23.976/23) は
@@ -336,7 +356,14 @@ def detect_silence_envelope(audio_file, start_sec, duration_sec,
     終端定義の曖昧さに由来する。そこで前後を同一基準＝1本の中央窓RMSエンベロープの
     閾値dB交差点で定義すると、対称パディングが定義上ぴったり前後同じ残し量になる。
 
-    返り値は (start_sec, end_sec) のリスト（絶対時間・秒）。numpy必須。
+    返り値は (silences, levels)。
+      silences: (start_sec, end_sec) のリスト（絶対時間・秒）
+      levels:   音声の実測値 {'peakDb','rmsDb','quietRatio','suggestDb','seconds'}
+                — 「なぜ切れなかったのか」を後から追える診断値。
+
+    音声を取り出せなかった場合は AudioAnalysisError を送出する
+    (無音0箇所として黙って返すと、カット0件のXMLが「成功」として出てしまう)。
+    numpy必須。
     """
     cmd = [
         'ffmpeg', '-hide_banner', '-v', 'error',
@@ -346,10 +373,21 @@ def detect_silence_envelope(audio_file, start_sec, duration_sec,
         '-vn', '-ac', '1', '-ar', str(sr),
         '-f', 's16le', '-'
     ]
-    raw = subprocess.run(cmd, capture_output=True, timeout=3600).stdout
-    x = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+    proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+    if proc.returncode != 0:
+        detail = (proc.stderr or b'').decode('utf-8', 'replace').strip()
+        raise AudioAnalysisError(
+            f"ffmpegでの音声抽出に失敗しました (exit {proc.returncode}): "
+            f"{os.path.basename(audio_file)}"
+            + (f"\n    ffmpeg: {detail[-400:]}" if detail else "")
+        )
+    x = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float64)
     if x.size == 0:
-        return []
+        raise AudioAnalysisError(
+            f"音声を1サンプルも取り出せませんでした: {os.path.basename(audio_file)} "
+            f"({start_sec:.2f}s から {duration_sec:.2f}s)。"
+            "音声トラックを持たない素材、または対応コーデックが無い可能性があります"
+        )
 
     # 中央窓RMS（O(N)の累積和で算出）— 前後の端を完全に同一の窓・基準で測る
     w = max(1, int(sr * win_ms / 1000))
@@ -376,7 +414,25 @@ def detect_silence_envelope(audio_file, start_sec, duration_sec,
     for s, e in zip(starts, ends):
         if e - s >= min_len:
             silences.append((start_sec + s / sr, start_sec + e / sr))
-    return silences
+
+    # ── 診断値 ───────────────────────────────────────────────────
+    # 「-40dB以下の無音があるのに切れない」の切り分けは、素材の実レベルが
+    # 分からないと不可能。閾値をどこまで上げれば検出できるかまで出す。
+    levels = {
+        'seconds': x.size / sr,
+        'peakDb': _db(float(np.abs(x).max())),
+        'rmsDb': _db(float(np.sqrt(np.mean(x * x)))),
+        'quietRatio': float(np.mean(quiet)),
+        'suggestDb': None,
+    }
+    # min_len 長のブロックに区切り、各ブロック内エンベロープの最大値のうち
+    # 最小のものを取る。その値を閾値にすれば「そのブロックは丸ごと閾値以下」
+    # = 最小無音長の無音が必ず1つ成立する (十分条件なので安全側の目安)。
+    n_blocks = x.size // min_len
+    if n_blocks >= 1:
+        block_max = env[:n_blocks * min_len].reshape(n_blocks, min_len).max(axis=1)
+        levels['suggestDb'] = _db(float(block_max.min()))
+    return silences, levels
 
 
 def main():
@@ -407,6 +463,11 @@ def main():
     parser.add_argument("--sequence-ntsc", default=None,
                         choices=["TRUE", "FALSE", "true", "false"],
                         help="--sequence-timebase と対で使うNTSCフラグ")
+    parser.add_argument("--allow-no-cut", action="store_true",
+                        help="カット箇所が0件でも、そのままXMLを出力して正常終了する。"
+                             "既定はエラー終了 (無音が1件も見つからないのに"
+                             "「カット済み」シーケンスを作ると、原因不明のまま"
+                             "未カットの中身が出来上がるため)")
     parser.add_argument("--no-fit-scale", action="store_true",
                         help="素材解像度がシーケンスと異なるクリップへの自動フィット"
                              "スケール付与を無効化 (「フレームサイズに合わせる」フラグは"
@@ -566,11 +627,29 @@ def main():
 
     all_silence_tl_frames = []
     a1_real_fps = None  # 情報表示用：A1メイン素材の実fps（probe_cacheはトラック収集フェーズと共有）
+    analyzed_count = 0          # 実際に音声を解析できたA1クリップ数
+    skipped_reasons = []        # 解析できなかったクリップとその理由
+    level_peak_db = None        # 全A1クリップの最大peak (dBFS)
+    level_energy = 0.0          # RMS算出用のエネルギー総和
+    level_seconds = 0.0
+    level_quiet_seconds = 0.0
+    suggest_db = None           # 「ここまで閾値を上げれば無音が見つかる」目安
 
     for ci, a1_clip in enumerate(a1_track['clips']):
         audio_file = a1_clip['filepath']
-        if not audio_file or not os.path.exists(audio_file):
-            print(f"  WARNING: A1クリップ{ci+1}の音声ファイルが見つかりません: {audio_file}")
+        if not audio_file:
+            # <file> を持たないクリップ (ネストシーケンス・マルチカム・
+            # 合成クリップ等)。音声の実体パスが無いので解析できない。
+            skipped_reasons.append(
+                f"A1クリップ{ci+1}: 音声ファイルの参照がありません "
+                f"(ネストシーケンス・マルチカム等はカットの基準にできません)")
+            print(f"  WARNING: {skipped_reasons[-1]}")
+            continue
+        if not os.path.exists(audio_file):
+            skipped_reasons.append(
+                f"A1クリップ{ci+1}: 音声ファイルが見つかりません "
+                f"({audio_file}) — 素材の移動・リンク切れの可能性")
+            print(f"  WARNING: {skipped_reasons[-1]}")
             continue
 
         fname = os.path.basename(audio_file)
@@ -601,8 +680,39 @@ def main():
 
         # 前後を同一基準で検出（中央窓RMSエンベロープの閾値dB交差）。
         # silencedetectは減衰する発話末尾の検出が約1f遅れ前後非対称になるため使わない。
-        silences = detect_silence_envelope(
-            audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
+        # 抽出失敗は AudioAnalysisError で上がる (無音0箇所へ倒さない)。
+        try:
+            silences, levels = detect_silence_envelope(
+                audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
+        except AudioAnalysisError as exc:
+            # 音声抽出の失敗は必ず止める。1クリップでも取り落とすと、
+            # その区間は「無音なし=全部残す」になり結果が静かに間違う。
+            print(f"\nERROR: 音声の抽出に失敗しました (A1クリップ{ci+1})")
+            print(f"  〖症状〗{exc}")
+            print("  〖なぜ〗ffmpegが素材の音声を読み出せませんでした "
+                  "(コーデック未対応・ファイル破損・アクセス権・素材の差し替え)")
+            print("  〖次の一手〗①Premiereで該当クリップが正常に再生できるか確認"
+                  " ②`ffmpeg -i \"<素材のパス>\"` をターミナルで実行してエラー内容を確認"
+                  " ③ffmpegを最新版へ更新 (Mac: brew upgrade ffmpeg /"
+                  " Windows: winget upgrade Gyan.FFmpeg)")
+            sys.exit(EXIT_AUDIO_FAILED)
+        analyzed_count += 1
+        if levels['peakDb'] is not None:
+            level_peak_db = (levels['peakDb'] if level_peak_db is None
+                             else max(level_peak_db, levels['peakDb']))
+        if levels['rmsDb'] is not None and levels['seconds'] > 0:
+            level_energy += (10 ** (levels['rmsDb'] / 10.0)) * levels['seconds']
+        level_seconds += levels['seconds']
+        level_quiet_seconds += levels['quietRatio'] * levels['seconds']
+        if levels['suggestDb'] is not None:
+            suggest_db = (levels['suggestDb'] if suggest_db is None
+                          else min(suggest_db, levels['suggestDb']))
+        peak_text = ('—' if levels['peakDb'] is None
+                     else f"{levels['peakDb']:.1f}dBFS")
+        rms_text = ('—' if levels['rmsDb'] is None
+                    else f"{levels['rmsDb']:.1f}dBFS")
+        print(f"    音声レベル: peak {peak_text} / RMS {rms_text} "
+              f"/ 閾値以下 {levels['quietRatio'] * 100:.1f}%")
         print(f"    検出無音: {len(silences)}箇所")
 
         # 検出秒（素材内の実時間）→ タイムラインframe。
@@ -618,6 +728,19 @@ def main():
                 a1_clip['tl_end'])
             if tf_end - tf_start >= min_silence_frames:
                 all_silence_tl_frames.append((tf_start, tf_end))
+
+    # 基準トラックの音声を1つも解析できていないなら、ここで止める。
+    # 従来はWARNINGを出して続行し「無音0箇所 = カット無し」のXMLを正常出力して
+    # いたため、利用者には「新シーケンスはできたが未カット」としか見えなかった。
+    if analyzed_count == 0:
+        print("\nERROR: 基準トラック A1 の音声を1クリップも解析できませんでした")
+        print("  〖なぜ〗A1の全クリップで音声ファイルを読めませんでした:")
+        for reason in skipped_reasons:
+            print(f"    - {reason}")
+        print("  〖次の一手〗①A1トラックに音声クリップ(素材の音声)が乗っているか確認"
+              " ②素材のリンク切れ(?マーク)がないか確認"
+              " ③ネスト/マルチカムのクリップは解除して素材を直接A1へ置く")
+        sys.exit(EXIT_AUDIO_FAILED)
 
     # マージ
     if all_silence_tl_frames:
@@ -637,6 +760,66 @@ def main():
         ce = tf_end - PADDING_FRAMES
         if ce > cs:
             cut_regions.append((cs, ce))
+
+    # ── 診断値 (毎回必ず出す) ──────────────────────────────────────
+    # 「カットされない」の切り分けに必要な数字を全部ログへ残す。
+    # 行頭タグ [診断] は呼び出し元 (cut_job.py) が機械的に読み取る契約。
+    silence_total_frames = sum(e - s for s, e in all_silence_tl_frames)
+    level_rms_db = (10.0 * math.log10(level_energy / level_seconds)
+                    if level_energy > 0 and level_seconds > 0 else None)
+    quiet_ratio = (level_quiet_seconds / level_seconds) if level_seconds > 0 else 0.0
+    print(f"[診断] 基準トラック: A1 / クリップ {len(a1_track['clips'])}本"
+          f" (解析 {analyzed_count} / スキップ {len(skipped_reasons)})")
+    print(f"[診断] 使用した設定: 閾値 {THRESHOLD_DB}dB / 最小無音 {MIN_SILENCE}s"
+          f" ({min_silence_frames}f) / パディング {PADDING_FRAMES}f")
+    print(f"[診断] 音声レベル実測: peak"
+          f" {'—' if level_peak_db is None else f'{level_peak_db:.1f}dBFS'} / RMS"
+          f" {'—' if level_rms_db is None else f'{level_rms_db:.1f}dBFS'}"
+          f" / 閾値以下の割合 {quiet_ratio * 100:.1f}%")
+    print(f"[診断] 検出した無音: {len(all_silence_tl_frames)}箇所"
+          f" / 合計 {silence_total_frames / timebase:.2f}秒")
+    print(f"[診断] カット区間: {len(cut_regions)}箇所")
+    # 実測エンベロープから「この値まで上げれば最小無音長の無音が必ず1つ成立する」
+    # 閾値を出す。1dBの余裕を足し、パネルの入力範囲 (-80〜-10) へ丸める。
+    recommend_db = None
+    if suggest_db is not None:
+        recommend_db = max(-80, min(-10, int(math.ceil(suggest_db + 1))))
+        print(f"[診断] 無音を検出できる閾値の目安: {recommend_db}dB"
+              f" (実測エンベロープ最小 {suggest_db:.1f}dB)")
+    # 一部だけ解析できなかった場合、その区間は無音ゼロ扱い = カットされない。
+    # 全滅なら上で停止しているので、ここは「部分的に取りこぼした」の可視化。
+    for reason in skipped_reasons:
+        print(f"[注意] {reason} → この区間はカットされません")
+
+    # カット区間が1つも無いなら「成功」にしない (沈黙の失敗の根治)。
+    if not cut_regions:
+        print("\nERROR: カットする箇所が1つもありませんでした")
+        if not all_silence_tl_frames:
+            print(f"  〖なぜ〗A1の音声から、閾値 {THRESHOLD_DB}dB 以下が"
+                  f" {MIN_SILENCE}秒以上続く区間を検出できませんでした"
+                  f" (実測: peak"
+                  f" {'—' if level_peak_db is None else f'{level_peak_db:.1f}dBFS'} / RMS"
+                  f" {'—' if level_rms_db is None else f'{level_rms_db:.1f}dBFS'})")
+            hint = (f"①無音とみなす音量を {recommend_db}dB へ上げる"
+                    f" (実測に基づく目安。パネルの「無音とみなす音量 (dB)」)"
+                    if recommend_db is not None
+                    else "①無音とみなす音量を上げる (-48 → -40 → -35)")
+            print(f"  〖次の一手〗{hint}"
+                  " ②最小無音長を短くする"
+                  " ③カットしたい無音がA1トラックの音声に入っているか確認"
+                  " (BGMや環境音が常に鳴っていると無音になりません)")
+        else:
+            print(f"  〖なぜ〗無音は {len(all_silence_tl_frames)}箇所"
+                  f" 検出しましたが、前後に残す量 (パディング {PADDING_FRAMES}f×2 ="
+                  f" {PADDING_FRAMES * 2}f) が無音の長さを上回るため、"
+                  "カット区間が残りませんでした")
+            print(f"  〖次の一手〗①前後に残す量を減らす (推奨: 最小無音長"
+                  f" {min_silence_frames}f の半分未満 = {max(0, min_silence_frames // 2 - 1)}f 以下)"
+                  " ②最小無音長を長くする")
+        if not args.allow_no_cut:
+            print("  (--allow-no-cut を付けると、カット0件でもそのまま出力します)")
+            sys.exit(EXIT_NO_CUT)
+        print("  --allow-no-cut 指定のため、カットせずそのまま出力します")
 
     # キープ区間（タイムライン全体）
     keep_tl_regions = []
