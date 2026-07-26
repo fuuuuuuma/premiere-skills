@@ -78,7 +78,9 @@ def transcribe(src: Path, full_wav: Path, seg_path: Path) -> str:
     if _mlx_available():
         w2s = _load_canonical()
         segs = w2s.run_whisper(str(full_wav))
-        seg_path.write_text(json.dumps(segs, ensure_ascii=False, indent=2))
+        seg_path.write_text(
+            json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return "mlx-single-pass"
     # CPU 環境: 従来の3並列転写（境界復元込み）に委譲。同じ seg_path を出力する
     r = subprocess.run(
@@ -174,19 +176,19 @@ def main() -> None:
     engine = transcribe(src, full_wav, seg_path)
     t_tr = time.time()
 
-    segs = json.loads(seg_path.read_text())
+    segs = json.loads(seg_path.read_text(encoding="utf-8"))
     segs = [s for s in segs if s.get("text", "").strip()]
     if not segs:
         print("エラー: 転写結果が空です")
         sys.exit(1)
-    full_path.write_text("".join(s["text"] for s in segs))
+    full_path.write_text("".join(s["text"] for s in segs), encoding="utf-8")
 
     ranges = split_parts(segs, a.n)
     parts = []
     for i, (s0, s1) in enumerate(ranges, 1):
         text = "".join(s["text"] for s in segs[s0:s1])
         p = out_dir / f"{stem}.part{i}.txt"
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
         parts.append({
             "idx": i,
             "path": str(p),
@@ -214,7 +216,9 @@ def main() -> None:
         "parts": parts,
     }
     mpath = out_dir / f"{stem}.parts.json"
-    mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    mpath.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print("MANIFEST:", mpath)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     print(f"PREPARE_SECONDS={time.time() - t0:.1f} (wav={t_wav - t0:.1f}s "

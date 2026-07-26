@@ -80,14 +80,14 @@ def merge_owned_segments(
     for p in owned_paths:
         p = Path(p)
         if p.exists():
-            owned.extend(json.loads(p.read_text()))
+            owned.extend(json.loads(p.read_text(encoding="utf-8")))
     owned.sort(key=lambda s: s.get("start", 0.0))
 
     overlap: list[dict] = []
     for p in overlap_paths or []:
         p = Path(p)
         if p.exists():
-            overlap.extend(json.loads(p.read_text()))
+            overlap.extend(json.loads(p.read_text(encoding="utf-8")))
     overlap.sort(key=lambda s: s.get("start", 0.0))
 
     coverage = _union_intervals(owned)

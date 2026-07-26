@@ -76,7 +76,7 @@ def main() -> None:
         print(r.stderr, file=sys.stderr)
         sys.exit(1)
     m = re.search(r"MANIFEST:\s*(\S+)", r.stdout)
-    manifest = json.loads(Path(m.group(1)).read_text())
+    manifest = json.loads(Path(m.group(1)).read_text(encoding="utf-8"))
     out_dir = Path(manifest["out_dir"])
     stem = manifest["stem"]
     if manifest.get("bounds_fallback"):
@@ -121,9 +121,9 @@ def main() -> None:
         [ovl for _, _, _, ovl, _ in procs],
     )
     seg_path = out_dir / f"{stem}.segments.json"
-    seg_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2))
+    seg_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     fulltext_path = out_dir / f"{stem}.fulltext.txt"
-    fulltext_path.write_text("".join(s.get("text", "") for s in merged))
+    fulltext_path.write_text("".join(s.get("text", "") for s in merged), encoding="utf-8")
 
     if not a.keep_intermediate:
         for c in manifest["chunks"]:

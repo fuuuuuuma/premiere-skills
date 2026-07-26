@@ -371,8 +371,20 @@ def _fw_load_model(cpu_threads: int = 0):
         device, compute_type = "auto", "auto"
 
     print(f"Whisper large-v3 を読み込み中... (device={device})")
-    return WhisperModel("large-v3", device=device, compute_type=compute_type,
-                        cpu_threads=cpu_threads)
+    try:
+        return WhisperModel("large-v3", device=device, compute_type=compute_type,
+                            cpu_threads=cpu_threads)
+    except Exception as e:
+        if device == "cpu":
+            raise
+        # device="auto"はGPUドライバの有無だけを見てCUDAを選ぶため、GPUは
+        # あるがcuDNNのDLL一式が未導入のWindows機ではモデル読込時に
+        # "Could not locate cudnn_ops...dll" 系の例外を投げてSRT全体が落ちる。
+        # CPU (int8) へフォールバックして転写自体は続行させる。
+        print(f"警告: GPU (device=auto) でのモデル読み込みに失敗しました: {e}")
+        print("CPU (int8) にフォールバックして再試行します...")
+        return WhisperModel("large-v3", device="cpu", compute_type="int8",
+                            cpu_threads=cpu_threads)
 
 
 def _run_whisper_faster(audio_path: str, cpu_threads: int = 0) -> list[dict]:

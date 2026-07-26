@@ -28,3 +28,19 @@
 - テキスト類似度 0.91（差分は表記ゆれ: 数字・アルファベット化で、チャンネル表記規則に整合）
 - 一致語の開始時刻ずれ: 中央値 80ms / p95 250ms（difflib全体アライメント＋カット点スナップで吸収域）
 - 全期間カバー・反復ハルシネーション 0件（38分フル動画でも確認）
+
+## faster-whisper (CPU/Windows/Linux) の device="auto" クラッシュ対策（2026-07-26・vendorからforward-port）
+
+`_fw_load_model()` は macOS 以外で `device="auto"` を渡すが、これは**GPUドライバの有無だけを見てCUDAを選ぶ**ため、
+GPUはあるが cuDNN のDLL一式が未導入の Windows 機ではモデル読込自体が例外
+（`Could not locate cudnn_ops64_9.dll` 等）を投げて `/srt` 全体が落ちる。
+`device="auto"`読込が失敗したら `device="cpu", compute_type="int8"` で再試行するフォールバックを追加した
+（`device=="cpu"`側で失敗した場合は無限フォールバックにならずそのまま例外を伝播する）。
+
+**由来**: この修正は Premiere プラグイン (`premiere-cut-srt-plugin`) の vendor コピーで
+2026-07-19 の「敵対的検証R1」ラウンドで先に発見・修正され、fail-firstテストと共に確定していたもの。
+canonical側はこの6日間更新されておらず、vendor側にだけ存在する状態が続いていた
+（vendor/正典乖離の一環として2026-07-26に forward-port。詳細は
+`~/.claude/projects/-Users-kawamurafuushin-ClaudeCode/memory/project_premiere_cut_srt_plugin.md` の
+該当エントリと plugin側 `HANDOFF.md`）。**canonical側でのWindows実機検証は未実施**（ロジックはvendorでの
+実績をそのまま移植したのみ）。
