@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-A1音声ベースの無音カット - 全トラック同期編集点
+音声トラックベースの無音カット - 全トラック同期編集点
 各トラックに複数クリップがある場合も正しく処理する。
-A1の各クリップの音声で無音検出し、全トラックに同じタイムライン位置で編集点を入れる。
+
+--tracks で指定した1本以上のオーディオトラック (既定 A1 のみ、後方互換) の
+各クリップの音声で独立に無音判定し、**指定した全トラックが同時に無音の区間だけ**
+をカットする (どれか1本でも音が鳴っていれば残す＝積集合)。編集点は全トラックへ
+同じタイムライン位置で同期適用する。
+
+ピンマイク2人以上の対話収録で「A1に片方の声しか乗っておらず、A2にもう片方の声が
+ある」場合、A1だけを見ると相手が話している区間まで無音としてカットしてしまう。
+--tracks A1,A2 のように両方を指定すると、両方が同時に無音の区間だけが残る。
 """
 
 import math
@@ -17,6 +25,8 @@ from urllib.parse import unquote, urlparse
 
 # Premiereのタイムベース非依存の絶対時間単位 (1秒あたりのtick数)。
 TICKS_PER_SECOND = 254016000000
+
+_WINDOWS_DRIVE_PATHURL_RE = re.compile(r"^/[A-Za-z]:")
 
 # 終了コード (呼び出し元が原因で分岐できるようにする。1=汎用エラー・2=argparse)
 EXIT_NO_CUT = 3          # 無音・カット区間が1つも無い (成功扱いにしない)
@@ -38,6 +48,72 @@ def _db(amplitude, full_scale=32768.0):
         return None
     return 20.0 * math.log10(amplitude / full_scale)
 
+
+# ── 複数トラック対応: 区間集合演算 ──────────────────────────────────
+# 「選択した全トラックが同時に無音の区間だけをカットする」= 各トラックの無音
+# 区間 (半開区間 [start, end) のタイムラインframe) を求め、その積集合を取る。
+# 素朴な実装だが区間数は無音候補の数程度 (実素材で数百〜数千止まり) なので
+# O(n log n) で十分高速。
+
+def merge_intervals(intervals):
+    """半開区間のリストをソートして隣接・重複を1本にマージする。"""
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged = [list(ordered[0])]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [tuple(x) for x in merged]
+
+
+def intersect_intervals(a, b):
+    """2つのソート・マージ済み半開区間リストの積集合 (両方に含まれる部分だけ)。"""
+    result = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        s = max(a[i][0], b[j][0])
+        e = min(a[i][1], b[j][1])
+        if s < e:
+            result.append((s, e))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return result
+
+
+def intersect_all(interval_lists):
+    """N個の区間リストの積集合。空リストが1つでもあれば結果は空。"""
+    if not interval_lists:
+        return []
+    result = merge_intervals(interval_lists[0])
+    for other in interval_lists[1:]:
+        if not result:
+            break
+        result = intersect_intervals(result, merge_intervals(other))
+    return result
+
+
+def invert_intervals(intervals, lo, hi):
+    """[lo, hi) の中で intervals (ソート・マージ済み) に含まれない部分 (=隙間) を返す。
+
+    「トラックにクリップが乗っていない区間」を検出するために使う
+    (音が無いので当然だが、無音判定を試みてすらいない=判定不能ではなく、
+    明示的に「無音」として扱う必要がある区間)。
+    """
+    gaps = []
+    cur = lo
+    for s, e in intervals:
+        if s > cur:
+            gaps.append((cur, s))
+        cur = max(cur, e)
+    if cur < hi:
+        gaps.append((cur, hi))
+    return gaps
+
 # conform_sequence_rate が「宣言レートの丸め誤差」として許容する最大の相対差。
 # 実際に確認済みの切り捨てケース (30↔29.97/29, 60↔59.94/59, 24↔23.976/23) は
 # いずれも4%以内。これを大きく超える差 (例: 30↔60の50%) は「Premiereの丸め」
@@ -50,7 +126,13 @@ MAX_PLAUSIBLE_CONFORM_DEVIATION = 0.08
 
 def pathurl_to_filepath(pathurl):
     parsed = urlparse(pathurl)
-    return unquote(parsed.path)
+    p = unquote(parsed.path)
+    # Windowsのドライブレター付きパス (file://localhost/C:/Users/... 等) は
+    # urlparse().path が '/C:/Users/...' というドライブ非認識の不正パスを返す。
+    # 先頭の '/' を1文字落として C:/Users/... に正規化する。
+    if _WINDOWS_DRIVE_PATHURL_RE.match(p):
+        p = p[1:]
+    return p
 
 
 def build_file_id_map(root):
@@ -435,10 +517,185 @@ def detect_silence_envelope(audio_file, start_sec, duration_sec,
     return silences, levels
 
 
+def _clip_coverage_intervals(clips, lo, hi):
+    """[lo, hi) の中で、いずれかのクリップが乗っている区間の和集合 (ソート・マージ済み)。"""
+    ivs = []
+    for c in clips:
+        s = max(lo, c['tl_start'])
+        e = min(hi, c['tl_end'])
+        if e > s:
+            ivs.append((s, e))
+    return merge_intervals(ivs)
+
+
+def analyze_track_silence(track_info, timebase, threshold_db, min_silence,
+                          min_silence_frames, probe_cache):
+    """1トラック分の全クリップを解析し、(無音区間リスト, 統計dict) を返す。
+
+    区間リストはクリップ**内**で検出した無音のみ (タイムラインframe、半開区間、
+    マージ済み)。トラックにクリップが乗っていない区間 (隙間) はここには含まない
+    — 呼び出し元が invert_intervals で明示的に無音として補う
+    (「データが無い＝判定不能」と取り違えないため、この関数の責務からは分離する)。
+
+    音声抽出に1クリップでも失敗したら (AudioAnalysisError)、他のトラックの
+    解析へ進まず即座にエラー終了する (fail-closed。1本でも取りこぼすと
+    その区間が「無音なし=全部残す」に静かに倒れて結果が間違う)。
+    """
+    label = track_info['label']
+    silence_intervals = []
+    analyzed_count = 0
+    skipped_reasons = []
+    peak_db = None
+    energy = 0.0
+    seconds = 0.0
+    quiet_seconds = 0.0
+    suggest_db = None
+
+    for ci, clip in enumerate(track_info['clips']):
+        audio_file = clip['filepath']
+        if not audio_file:
+            # <file> を持たないクリップ (ネストシーケンス・マルチカム・
+            # 合成クリップ等)。音声の実体パスが無いので解析できない。
+            skipped_reasons.append(
+                f"{label}クリップ{ci+1}: 音声ファイルの参照がありません "
+                f"(ネストシーケンス・マルチカム等はカットの基準にできません)")
+            print(f"  WARNING: {skipped_reasons[-1]}")
+            continue
+        if not os.path.exists(audio_file):
+            skipped_reasons.append(
+                f"{label}クリップ{ci+1}: 音声ファイルが見つかりません "
+                f"({audio_file}) — 素材の移動・リンク切れの可能性")
+            print(f"  WARNING: {skipped_reasons[-1]}")
+            continue
+
+        fname = os.path.basename(audio_file)
+        # 時間↔フレームの換算は必ずシーケンス宣言timebaseで行う。
+        # 音声は実時間で再生され、タイムラインは宣言fps（例: 30.0）で刻むので、
+        # 実音声 T 秒は timeline フレーム T*timebase に置かれる。動画の実fps(例: 29.998)は
+        # 音声配置に無関係。ここで実fpsを使うと毎秒(timebase-実fps)分ずれ、後半ほど累積ドリフトする。
+        # 実fpsは末尾クランプの判定とfps正規化の判断にのみ使う。
+        if audio_file not in probe_cache:
+            probe_cache[audio_file] = probe_media_fps_duration(audio_file)
+        real_fps, media_dur = probe_cache[audio_file]
+        # in/out はクリップ自身のrate単位なので、素材内の時刻もそのrateで割る
+        clip_fps = clip.get('clip_fps') or timebase
+        in_sec = clip['in_sec']
+        dur_sec = (clip['out_frame'] - clip['in_frame']) / clip_fps
+        # 解析窓を実メディア長でクランプ（窓が実体を超過して末尾を取りこぼすのを防ぐ安全網）
+        if media_dur is not None:
+            max_dur = media_dur - in_sec
+            if max_dur > 0 and dur_sec > max_dur + 0.5:
+                print(f"    ⚠ 解析窓 {in_sec + dur_sec:.1f}s が実メディア長 {media_dur:.1f}s を超過 → クランプ")
+                dur_sec = max_dur
+        print(f"  {label} クリップ{ci+1}: {fname}")
+        if real_fps and abs(real_fps - timebase) > 0.01:
+            print(f"    実fps={real_fps:.4f}（宣言timebase={timebase:.4f}）→ 換算は宣言timebase基準（音声は実時間配置）")
+        print(f"    解析範囲: {in_sec:.2f}s ～ {in_sec + dur_sec:.2f}s ({dur_sec:.1f}s)")
+
+        # 前後を同一基準で検出（中央窓RMSエンベロープの閾値dB交差）。
+        # silencedetectは減衰する発話末尾の検出が約1f遅れ前後非対称になるため使わない。
+        # 抽出失敗は AudioAnalysisError で上がる (無音0箇所へ倒さない)。
+        try:
+            silences, levels = detect_silence_envelope(
+                audio_file, in_sec, dur_sec, threshold_db, min_silence)
+        except AudioAnalysisError as exc:
+            # 音声抽出の失敗は必ず止める。1クリップでも取り落とすと、
+            # その区間は「無音なし=全部残す」になり結果が静かに間違う。
+            print(f"\nERROR: 音声の抽出に失敗しました ({label}クリップ{ci+1})")
+            print(f"  〖症状〗{exc}")
+            print("  〖なぜ〗ffmpegが素材の音声を読み出せませんでした "
+                  "(コーデック未対応・ファイル破損・アクセス権・素材の差し替え)")
+            print("  〖次の一手〗①Premiereで該当クリップが正常に再生できるか確認"
+                  " ②`ffmpeg -i \"<素材のパス>\"` をターミナルで実行してエラー内容を確認"
+                  " ③ffmpegを最新版へ更新 (Mac: brew upgrade ffmpeg /"
+                  " Windows: winget upgrade Gyan.FFmpeg)")
+            print(f"[診断] 音声抽出に失敗したトラック: {label}")
+            sys.exit(EXIT_AUDIO_FAILED)
+        analyzed_count += 1
+        if levels['peakDb'] is not None:
+            peak_db = (levels['peakDb'] if peak_db is None
+                      else max(peak_db, levels['peakDb']))
+        if levels['rmsDb'] is not None and levels['seconds'] > 0:
+            energy += (10 ** (levels['rmsDb'] / 10.0)) * levels['seconds']
+        seconds += levels['seconds']
+        quiet_seconds += levels['quietRatio'] * levels['seconds']
+        if levels['suggestDb'] is not None:
+            suggest_db = (levels['suggestDb'] if suggest_db is None
+                         else min(suggest_db, levels['suggestDb']))
+        peak_text = ('—' if levels['peakDb'] is None
+                     else f"{levels['peakDb']:.1f}dBFS")
+        rms_text = ('—' if levels['rmsDb'] is None
+                    else f"{levels['rmsDb']:.1f}dBFS")
+        print(f"    音声レベル: peak {peak_text} / RMS {rms_text} "
+              f"/ 閾値以下 {levels['quietRatio'] * 100:.1f}%")
+        print(f"    検出無音: {len(silences)}箇所")
+
+        # 検出秒（素材内の実時間）→ タイムラインframe。
+        # 素材内の経過時間 (s - in_sec) をシーケンスtimebaseで刻み、クリップの
+        # タイムライン開始位置へ足す。素材側の単位 (clip_fps) はin_secに畳んで
+        # あるため、ここは常にシーケンス基準の整数フレームになる。
+        for s_start, s_end in silences:
+            tf_start = max(
+                clip['tl_start'] + int(round((s_start - in_sec) * timebase)),
+                clip['tl_start'])
+            tf_end = min(
+                clip['tl_start'] + int(round((s_end - in_sec) * timebase)),
+                clip['tl_end'])
+            if tf_end - tf_start >= min_silence_frames:
+                silence_intervals.append((tf_start, tf_end))
+
+    rms_db = (10.0 * math.log10(energy / seconds)
+              if energy > 0 and seconds > 0 else None)
+    quiet_ratio = (quiet_seconds / seconds) if seconds > 0 else 0.0
+    stats = {
+        'label': label,
+        'clipCount': len(track_info['clips']),
+        'analyzedCount': analyzed_count,
+        'skippedReasons': skipped_reasons,
+        'peakDb': peak_db,
+        'rmsDb': rms_db,
+        'quietRatio': quiet_ratio,
+        'suggestDb': suggest_db,
+        'seconds': seconds,
+        'energy': energy,
+        'quietSeconds': quiet_seconds,
+    }
+    return merge_intervals(silence_intervals), stats
+
+
+DEFAULT_TRACKS = ("A1",)  # 後方互換の既定値 (従来のA1専用挙動と完全に一致させる)
+_TRACK_LABEL_RE = re.compile(r"^A\d+$")
+
+
+def parse_track_labels(raw):
+    """--tracks の生文字列 (カンマ区切り) を正規化したラベルのタプルへ変換する。
+
+    大文字化・空白除去・重複除去 (順序は保持)。空文字列や不正形式 (A1以外の
+    "A<数字>" でないもの) は呼び出し元の argparse エラーとして扱えるよう
+    ValueError を送出する。
+    """
+    labels = []
+    seen = set()
+    for token in (raw or "").split(","):
+        label = token.strip().upper()
+        if not label:
+            continue
+        if not _TRACK_LABEL_RE.match(label):
+            raise ValueError(
+                f"--tracks の指定が不正です: '{token.strip()}' "
+                f"(A1, A2 のような形式で指定してください)")
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    if not labels:
+        raise ValueError("--tracks に有効なトラックが1つも指定されていません")
+    return tuple(labels)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="A1音声ベース 無音カット（全トラック同期編集点）",
+        description="音声トラックベース 無音カット（全トラック同期編集点）",
     )
     parser.add_argument("input_xml", help="入力 Premiere Pro XML のパス")
     parser.add_argument(
@@ -450,6 +707,11 @@ def main():
         help="出力ディレクトリ。指定時はこのディレクトリに '<basename>_カット済み.xml' を配置。"
              "推奨: $REPO_DIR/output/cut/",
     )
+    parser.add_argument("--tracks", default=",".join(DEFAULT_TRACKS),
+                        help="無音判定に使うオーディオトラックをカンマ区切りで指定 (例: A1,A2)。"
+                             "指定した全トラックが同時に無音の区間だけをカットする"
+                             "(どれか1本でも音が鳴っていれば残す＝積集合)。"
+                             "既定は A1 のみ (従来と同じ挙動)")
     parser.add_argument("--threshold", type=float, default=-48,
                         help="無音判定の閾値(dB)。小さい値ほど厳しく(=カット減)。ぶつぶつ喋りは -45〜-50 推奨")
     parser.add_argument("--min-silence", type=float, default=0.2,
@@ -474,6 +736,12 @@ def main():
                              "XMLに保存されないため、既定では自動付与して見た目を保つ)")
     args = parser.parse_args()
 
+    try:
+        TRACK_LABELS = parse_track_labels(args.tracks)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
+
     input_xml = args.input_xml
     base, ext = os.path.splitext(input_xml)
     basename_noext = os.path.basename(base)
@@ -491,10 +759,12 @@ def main():
     PADDING_FRAMES = args.padding
 
     print("=" * 60)
-    print("A1音声ベース 無音カット（全トラック同期）")
+    print("音声トラックベース 無音カット（全トラック同期）")
     print("=" * 60)
     print(f"入力: {input_xml}")
     print(f"出力: {output_xml}")
+    print(f"判定トラック: {'+'.join(TRACK_LABELS)}"
+          f"{' (複数トラックの積集合＝全て同時に無音の区間だけカット)' if len(TRACK_LABELS) > 1 else ''}")
     print(f"閾値: {THRESHOLD_DB}dB | 最小無音: {MIN_SILENCE}s | パディング: {PADDING_FRAMES}f")
 
     # ── XML解析 ──
@@ -612,146 +882,112 @@ def main():
                 'clips': clips,
             })
 
-    # ── A1の全クリップで無音検出 ──
-    print("\n[3/4] A1音声で無音検出...")
+    # ── 選択トラックの無音検出 ──
+    base_track_label = '+'.join(TRACK_LABELS)
+    print(f"\n[3/4] {base_track_label} の音声で無音検出...")
 
-    a1_track = next((t for t in tracks if t['label'] == 'A1'), None)
-    if a1_track is None:
-        print("ERROR: A1トラックが見つかりません")
+    tracks_by_label = {t['label']: t for t in tracks}
+    existing_labels = [l for l in TRACK_LABELS if l in tracks_by_label]
+    missing_labels = [l for l in TRACK_LABELS if l not in tracks_by_label]
+    single_track_mode = len(TRACK_LABELS) == 1
+
+    if not existing_labels:
+        print(f"ERROR: 指定したトラック ({base_track_label}) が見つかりません"
+              " (クリップが1つも乗っていません)")
         sys.exit(1)
+    if single_track_mode and missing_labels:
+        # 後方互換: 従来の「A1トラックが見つかりません」と完全に同じ扱い
+        # (単一トラック選択時は積集合の概念が無く、そのトラックが無ければ
+        # 判定材料そのものが無い)。
+        print(f"ERROR: {missing_labels[0]}トラックが見つかりません")
+        sys.exit(1)
+    for label in missing_labels:
+        # 複数トラック選択時のみ到達する。クリップが無い=音が鳴りようがない
+        # ので「無音」として扱う (「データが無い＝判定不能」と取り違えない)。
+        # 積集合上は制約を課さない (他の選択トラックの判定がそのまま通る)。
+        print(f"  WARNING: {label}: クリップが1つもありません"
+              " → 全区間を無音として扱います (このトラックはカットの妨げになりません)")
 
-    # タイムライン全体の範囲
-    tl_total_start = max(0, min(c['tl_start'] for c in a1_track['clips']))
-    tl_total_end = max(c['tl_end'] for c in a1_track['clips'])
+    # タイムライン全体の範囲 (実在する選択トラックの和集合)
+    tl_total_start = min(
+        max(0, min(c['tl_start'] for c in tracks_by_label[l]['clips']))
+        for l in existing_labels)
+    tl_total_end = max(
+        max(c['tl_end'] for c in tracks_by_label[l]['clips'])
+        for l in existing_labels)
     tl_duration = tl_total_end - tl_total_start
 
-    all_silence_tl_frames = []
-    a1_real_fps = None  # 情報表示用：A1メイン素材の実fps（probe_cacheはトラック収集フェーズと共有）
-    analyzed_count = 0          # 実際に音声を解析できたA1クリップ数
-    skipped_reasons = []        # 解析できなかったクリップとその理由
-    level_peak_db = None        # 全A1クリップの最大peak (dBFS)
-    level_energy = 0.0          # RMS算出用のエネルギー総和
-    level_seconds = 0.0
-    level_quiet_seconds = 0.0
-    suggest_db = None           # 「ここまで閾値を上げれば無音が見つかる」目安
+    per_track_stats = []       # トラックごとの診断値 (複数トラック時のみ出力)
+    track_silence_sets = []    # 各トラックの無音区間 (積集合の入力)
+    all_skipped_reasons = []
+    total_analyzed = 0
+    total_clip_count = 0
+    combined_peak_db = None
+    combined_energy = 0.0
+    combined_seconds = 0.0
+    combined_quiet_seconds = 0.0
+    combined_suggest_db = None
 
-    for ci, a1_clip in enumerate(a1_track['clips']):
-        audio_file = a1_clip['filepath']
-        if not audio_file:
-            # <file> を持たないクリップ (ネストシーケンス・マルチカム・
-            # 合成クリップ等)。音声の実体パスが無いので解析できない。
-            skipped_reasons.append(
-                f"A1クリップ{ci+1}: 音声ファイルの参照がありません "
-                f"(ネストシーケンス・マルチカム等はカットの基準にできません)")
-            print(f"  WARNING: {skipped_reasons[-1]}")
-            continue
-        if not os.path.exists(audio_file):
-            skipped_reasons.append(
-                f"A1クリップ{ci+1}: 音声ファイルが見つかりません "
-                f"({audio_file}) — 素材の移動・リンク切れの可能性")
-            print(f"  WARNING: {skipped_reasons[-1]}")
+    for label in TRACK_LABELS:
+        if label in missing_labels:
+            per_track_stats.append({
+                'label': label, 'missing': True, 'clipCount': 0,
+                'analyzedCount': 0, 'skippedReasons': [],
+                'peakDb': None, 'rmsDb': None, 'quietRatio': None,
+            })
+            track_silence_sets.append([(tl_total_start, tl_total_end)])
             continue
 
-        fname = os.path.basename(audio_file)
-        # 時間↔フレームの換算は必ずシーケンス宣言timebaseで行う。
-        # 音声は実時間で再生され、タイムラインは宣言fps（例: 30.0）で刻むので、
-        # 実音声 T 秒は timeline フレーム T*timebase に置かれる。動画の実fps(例: 29.998)は
-        # 音声配置に無関係。ここで実fpsを使うと毎秒(timebase-実fps)分ずれ、後半ほど累積ドリフトする。
-        # 実fpsは末尾クランプの判定とfps正規化の判断にのみ使う。
-        if audio_file not in probe_cache:
-            probe_cache[audio_file] = probe_media_fps_duration(audio_file)
-        real_fps, media_dur = probe_cache[audio_file]
-        if a1_real_fps is None and real_fps:
-            a1_real_fps = real_fps
-        # in/out はクリップ自身のrate単位なので、素材内の時刻もそのrateで割る
-        clip_fps = a1_clip.get('clip_fps') or timebase
-        in_sec = a1_clip['in_sec']
-        dur_sec = (a1_clip['out_frame'] - a1_clip['in_frame']) / clip_fps
-        # 解析窓を実メディア長でクランプ（窓が実体を超過して末尾を取りこぼすのを防ぐ安全網）
-        if media_dur is not None:
-            max_dur = media_dur - in_sec
-            if max_dur > 0 and dur_sec > max_dur + 0.5:
-                print(f"    ⚠ 解析窓 {in_sec + dur_sec:.1f}s が実メディア長 {media_dur:.1f}s を超過 → クランプ")
-                dur_sec = max_dur
-        print(f"  クリップ{ci+1}: {fname}")
-        if real_fps and abs(real_fps - timebase) > 0.01:
-            print(f"    実fps={real_fps:.4f}（宣言timebase={timebase:.4f}）→ 換算は宣言timebase基準（音声は実時間配置）")
-        print(f"    解析範囲: {in_sec:.2f}s ～ {in_sec + dur_sec:.2f}s ({dur_sec:.1f}s)")
+        track_info = tracks_by_label[label]
+        clip_silence, stats = analyze_track_silence(
+            track_info, timebase, THRESHOLD_DB, MIN_SILENCE,
+            min_silence_frames, probe_cache)
 
-        # 前後を同一基準で検出（中央窓RMSエンベロープの閾値dB交差）。
-        # silencedetectは減衰する発話末尾の検出が約1f遅れ前後非対称になるため使わない。
-        # 抽出失敗は AudioAnalysisError で上がる (無音0箇所へ倒さない)。
-        try:
-            silences, levels = detect_silence_envelope(
-                audio_file, in_sec, dur_sec, THRESHOLD_DB, MIN_SILENCE)
-        except AudioAnalysisError as exc:
-            # 音声抽出の失敗は必ず止める。1クリップでも取り落とすと、
-            # その区間は「無音なし=全部残す」になり結果が静かに間違う。
-            print(f"\nERROR: 音声の抽出に失敗しました (A1クリップ{ci+1})")
-            print(f"  〖症状〗{exc}")
-            print("  〖なぜ〗ffmpegが素材の音声を読み出せませんでした "
-                  "(コーデック未対応・ファイル破損・アクセス権・素材の差し替え)")
-            print("  〖次の一手〗①Premiereで該当クリップが正常に再生できるか確認"
-                  " ②`ffmpeg -i \"<素材のパス>\"` をターミナルで実行してエラー内容を確認"
-                  " ③ffmpegを最新版へ更新 (Mac: brew upgrade ffmpeg /"
-                  " Windows: winget upgrade Gyan.FFmpeg)")
+        # このトラックの音声を1つも解析できていないなら、ここで止める。
+        # 従来はWARNINGを出して続行し「無音0箇所 = カット無し」のXMLを正常出力して
+        # いたため、利用者には「新シーケンスはできたが未カット」としか見えなかった。
+        # 複数トラック選択時にこれを黙って「常に無音」へ倒すと、実際には解析
+        # できていないのに判定に使えたかのように見えてしまう (fail-closed)。
+        if stats['analyzedCount'] == 0:
+            print(f"\nERROR: トラック {label} の音声を1クリップも解析できませんでした")
+            print(f"  〖なぜ〗{label}の全クリップで音声ファイルを読めませんでした:")
+            for reason in stats['skippedReasons']:
+                print(f"    - {reason}")
+            print(f"  〖次の一手〗①{label}トラックに音声クリップ(素材の音声)が乗っているか確認"
+                  " ②素材のリンク切れ(?マーク)がないか確認"
+                  f" ③ネスト/マルチカムのクリップは解除して素材を直接{label}へ置く")
+            print(f"[診断] 解析不能トラック: {label}")
             sys.exit(EXIT_AUDIO_FAILED)
-        analyzed_count += 1
-        if levels['peakDb'] is not None:
-            level_peak_db = (levels['peakDb'] if level_peak_db is None
-                             else max(level_peak_db, levels['peakDb']))
-        if levels['rmsDb'] is not None and levels['seconds'] > 0:
-            level_energy += (10 ** (levels['rmsDb'] / 10.0)) * levels['seconds']
-        level_seconds += levels['seconds']
-        level_quiet_seconds += levels['quietRatio'] * levels['seconds']
-        if levels['suggestDb'] is not None:
-            suggest_db = (levels['suggestDb'] if suggest_db is None
-                          else min(suggest_db, levels['suggestDb']))
-        peak_text = ('—' if levels['peakDb'] is None
-                     else f"{levels['peakDb']:.1f}dBFS")
-        rms_text = ('—' if levels['rmsDb'] is None
-                    else f"{levels['rmsDb']:.1f}dBFS")
-        print(f"    音声レベル: peak {peak_text} / RMS {rms_text} "
-              f"/ 閾値以下 {levels['quietRatio'] * 100:.1f}%")
-        print(f"    検出無音: {len(silences)}箇所")
 
-        # 検出秒（素材内の実時間）→ タイムラインframe。
-        # 素材内の経過時間 (s - in_sec) をシーケンスtimebaseで刻み、クリップの
-        # タイムライン開始位置へ足す。素材側の単位 (clip_fps) はin_secに畳んで
-        # あるため、ここは常にシーケンス基準の整数フレームになる。
-        for s_start, s_end in silences:
-            tf_start = max(
-                a1_clip['tl_start'] + int(round((s_start - in_sec) * timebase)),
-                a1_clip['tl_start'])
-            tf_end = min(
-                a1_clip['tl_start'] + int(round((s_end - in_sec) * timebase)),
-                a1_clip['tl_end'])
-            if tf_end - tf_start >= min_silence_frames:
-                all_silence_tl_frames.append((tf_start, tf_end))
+        per_track_stats.append(stats)
+        total_analyzed += stats['analyzedCount']
+        total_clip_count += stats['clipCount']
+        all_skipped_reasons.extend(stats['skippedReasons'])
+        if stats['peakDb'] is not None:
+            combined_peak_db = (stats['peakDb'] if combined_peak_db is None
+                                else max(combined_peak_db, stats['peakDb']))
+        combined_energy += stats['energy']
+        combined_seconds += stats['seconds']
+        combined_quiet_seconds += stats['quietSeconds']
+        if stats['suggestDb'] is not None:
+            combined_suggest_db = (stats['suggestDb'] if combined_suggest_db is None
+                                   else min(combined_suggest_db, stats['suggestDb']))
 
-    # 基準トラックの音声を1つも解析できていないなら、ここで止める。
-    # 従来はWARNINGを出して続行し「無音0箇所 = カット無し」のXMLを正常出力して
-    # いたため、利用者には「新シーケンスはできたが未カット」としか見えなかった。
-    if analyzed_count == 0:
-        print("\nERROR: 基準トラック A1 の音声を1クリップも解析できませんでした")
-        print("  〖なぜ〗A1の全クリップで音声ファイルを読めませんでした:")
-        for reason in skipped_reasons:
-            print(f"    - {reason}")
-        print("  〖次の一手〗①A1トラックに音声クリップ(素材の音声)が乗っているか確認"
-              " ②素材のリンク切れ(?マーク)がないか確認"
-              " ③ネスト/マルチカムのクリップは解除して素材を直接A1へ置く")
-        sys.exit(EXIT_AUDIO_FAILED)
+        if single_track_mode:
+            # 後方互換: 従来通りクリップ内で検出した無音のみを使う
+            # (トラック全体に対する隙間の無音合成はしない＝完全に同じ結果)。
+            track_silence_sets.append(clip_silence)
+        else:
+            # 「トラックにクリップが乗っていない区間」も無音として明示的に扱う
+            # (音が無いので当然だが、判定不能と取り違えやすいため明示処理する)。
+            coverage = _clip_coverage_intervals(
+                track_info['clips'], tl_total_start, tl_total_end)
+            gaps = invert_intervals(coverage, tl_total_start, tl_total_end)
+            track_silence_sets.append(merge_intervals(list(clip_silence) + gaps))
 
-    # マージ
-    if all_silence_tl_frames:
-        all_silence_tl_frames.sort()
-        merged = [list(all_silence_tl_frames[0])]
-        for s, e in all_silence_tl_frames[1:]:
-            if s <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], e)
-            else:
-                merged.append([s, e])
-        all_silence_tl_frames = [tuple(x) for x in merged]
+    # 積集合: 選択した全トラックが同時に無音の区間だけを最終的な無音とする
+    # (単一トラック選択時は積集合が1本だけなので、従来と完全に同じ結果になる)。
+    all_silence_tl_frames = intersect_all(track_silence_sets) if track_silence_sets else []
 
     # パディング適用 → カット区間
     cut_regions = []
@@ -764,50 +1000,68 @@ def main():
     # ── 診断値 (毎回必ず出す) ──────────────────────────────────────
     # 「カットされない」の切り分けに必要な数字を全部ログへ残す。
     # 行頭タグ [診断] は呼び出し元 (cut_job.py) が機械的に読み取る契約。
+    # 単一トラック選択時は全ての値が従来のA1専用実装と完全に同じ計算になる
+    # (pool対象が1トラックだけになるため)。
     silence_total_frames = sum(e - s for s, e in all_silence_tl_frames)
-    level_rms_db = (10.0 * math.log10(level_energy / level_seconds)
-                    if level_energy > 0 and level_seconds > 0 else None)
-    quiet_ratio = (level_quiet_seconds / level_seconds) if level_seconds > 0 else 0.0
-    print(f"[診断] 基準トラック: A1 / クリップ {len(a1_track['clips'])}本"
-          f" (解析 {analyzed_count} / スキップ {len(skipped_reasons)})")
+    combined_rms_db = (10.0 * math.log10(combined_energy / combined_seconds)
+                       if combined_energy > 0 and combined_seconds > 0 else None)
+    combined_quiet_ratio = (
+        combined_quiet_seconds / combined_seconds if combined_seconds > 0 else 0.0)
+    print(f"[診断] 基準トラック: {base_track_label} / クリップ {total_clip_count}本"
+          f" (解析 {total_analyzed} / スキップ {len(all_skipped_reasons)})")
     print(f"[診断] 使用した設定: 閾値 {THRESHOLD_DB}dB / 最小無音 {MIN_SILENCE}s"
           f" ({min_silence_frames}f) / パディング {PADDING_FRAMES}f")
     print(f"[診断] 音声レベル実測: peak"
-          f" {'—' if level_peak_db is None else f'{level_peak_db:.1f}dBFS'} / RMS"
-          f" {'—' if level_rms_db is None else f'{level_rms_db:.1f}dBFS'}"
-          f" / 閾値以下の割合 {quiet_ratio * 100:.1f}%")
+          f" {'—' if combined_peak_db is None else f'{combined_peak_db:.1f}dBFS'} / RMS"
+          f" {'—' if combined_rms_db is None else f'{combined_rms_db:.1f}dBFS'}"
+          f" / 閾値以下の割合 {combined_quiet_ratio * 100:.1f}%")
+    if len(TRACK_LABELS) > 1:
+        # 複数トラック選択時のみ、積集合の根拠が追えるようトラック別の実測値を出す。
+        for stats in per_track_stats:
+            label = stats['label']
+            if stats.get('missing'):
+                print(f"[診断] トラック{label}: クリップなし → 全区間を無音として扱います")
+                continue
+            peak_text = ('—' if stats['peakDb'] is None
+                        else f"{stats['peakDb']:.1f}dBFS")
+            rms_text = ('—' if stats['rmsDb'] is None
+                       else f"{stats['rmsDb']:.1f}dBFS")
+            print(f"[診断] トラック{label}: peak {peak_text} / RMS {rms_text}"
+                  f" / 閾値以下 {stats['quietRatio'] * 100:.1f}%"
+                  f" (解析 {stats['analyzedCount']} / スキップ {len(stats['skippedReasons'])})")
     print(f"[診断] 検出した無音: {len(all_silence_tl_frames)}箇所"
           f" / 合計 {silence_total_frames / timebase:.2f}秒")
     print(f"[診断] カット区間: {len(cut_regions)}箇所")
     # 実測エンベロープから「この値まで上げれば最小無音長の無音が必ず1つ成立する」
     # 閾値を出す。1dBの余裕を足し、パネルの入力範囲 (-80〜-10) へ丸める。
     recommend_db = None
-    if suggest_db is not None:
-        recommend_db = max(-80, min(-10, int(math.ceil(suggest_db + 1))))
+    if combined_suggest_db is not None:
+        recommend_db = max(-80, min(-10, int(math.ceil(combined_suggest_db + 1))))
         print(f"[診断] 無音を検出できる閾値の目安: {recommend_db}dB"
-              f" (実測エンベロープ最小 {suggest_db:.1f}dB)")
+              f" (実測エンベロープ最小 {combined_suggest_db:.1f}dB)")
     # 一部だけ解析できなかった場合、その区間は無音ゼロ扱い = カットされない。
     # 全滅なら上で停止しているので、ここは「部分的に取りこぼした」の可視化。
-    for reason in skipped_reasons:
+    for reason in all_skipped_reasons:
         print(f"[注意] {reason} → この区間はカットされません")
 
     # カット区間が1つも無いなら「成功」にしない (沈黙の失敗の根治)。
     if not cut_regions:
         print("\nERROR: カットする箇所が1つもありませんでした")
         if not all_silence_tl_frames:
-            print(f"  〖なぜ〗A1の音声から、閾値 {THRESHOLD_DB}dB 以下が"
+            print(f"  〖なぜ〗{base_track_label}の音声から、閾値 {THRESHOLD_DB}dB 以下が"
                   f" {MIN_SILENCE}秒以上続く区間を検出できませんでした"
                   f" (実測: peak"
-                  f" {'—' if level_peak_db is None else f'{level_peak_db:.1f}dBFS'} / RMS"
-                  f" {'—' if level_rms_db is None else f'{level_rms_db:.1f}dBFS'})")
+                  f" {'—' if combined_peak_db is None else f'{combined_peak_db:.1f}dBFS'} / RMS"
+                  f" {'—' if combined_rms_db is None else f'{combined_rms_db:.1f}dBFS'})")
             hint = (f"①無音とみなす音量を {recommend_db}dB へ上げる"
                     f" (実測に基づく目安。パネルの「無音とみなす音量 (dB)」)"
                     if recommend_db is not None
                     else "①無音とみなす音量を上げる (-48 → -40 → -35)")
             print(f"  〖次の一手〗{hint}"
                   " ②最小無音長を短くする"
-                  " ③カットしたい無音がA1トラックの音声に入っているか確認"
-                  " (BGMや環境音が常に鳴っていると無音になりません)")
+                  f" ③カットしたい無音が{base_track_label}の音声に入っているか確認"
+                  " (BGMや環境音が常に鳴っていると無音になりません。BGM/音楽トラックを"
+                  "判定対象に選ぶと常に「音がある」判定になり何もカットされなくなります)")
         else:
             print(f"  〖なぜ〗無音は {len(all_silence_tl_frames)}箇所"
                   f" 検出しましたが、前後に残す量 (パディング {PADDING_FRAMES}f×2 ="
