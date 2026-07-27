@@ -1330,6 +1330,7 @@ def main():
     # 完全一致しない (想定外・危険信号)。後者は必ず警告として出す。
     dropped_links_dangling = 0
     dropped_links_no_exact_match = 0
+    approximated_links_unique_candidate = 0
     for track_idx, track_info in enumerate(tracks):
         track_elem = track_info['track_elem']
 
@@ -1400,7 +1401,7 @@ def main():
             # 誤バインドを起こす。mic_gate.py の全除去方針と同じ扱い）
             #
             # 2026-07-27 実機報告「ピンマイク2本を別チャンネルに録った素材で
-            # カット後にオーディオチャンネル割り当てが壊れる」の修正:
+            # カット後にオーディオチャンネル割り当てが壊れる」の修正 (ead23ec):
             # 以前は完全一致する対応クリップが無い場合、「最も重なりが大きい
             # クリップ」へ近似フォールバックしていた。これは別のステレオ振り分け
             # ペア (例: 別トラックの別マイク用クリップ) を誤って同一リンクグループへ
@@ -1408,12 +1409,15 @@ def main():
             # 「本来のペアが孤立し (どのソースにも繋がらない)、無関係な
             # クリップ同士が誤って繋がる」形でオーディオチャンネル表示が
             # 壊れる (Modify Clip > Audio Channels が「カスタム」化し、
-            # 割り当てが入れ替わる/消える)。真にリンクされたステレオ展開ペア
-            # (currentExplodedTrackIndex) は同じキープ区間から生成されるため、
-            # 正常な入力なら常に完全一致する。完全一致が無い＝入力側の時点で
-            # ペアの境界が食い違っている (カット処理の責任範囲外) ので、
-            # 近似せずリンクを除去し、警告として明示する
-            # (チャンネル配線に関わる情報は、保持できないなら黙って作り直さない)。
+            # 割り当てが入れ替わる/消える)。
+            #
+            # 2026-07-28 (今回): その後の調査で、この実機報告の原因はPremiereの
+            # FCP XML書き出し仕様側にあり、近似フォールバックとは無関係だったと
+            # 判明した。一方、ead23ec の無条件除去には副作用があり、実素材の
+            # カットで正当なリンクを12件失っていた (末尾1箇所に集中、内訳は
+            # find_matching_sub_idx のdocstring参照)。そこで
+            # 「重なりを持つ候補がちょうど1つの場合に限り」近似接続するよう
+            # 緩和する (詳細な安全性の理由は find_matching_sub_idx を参照)。
             for link in new_clip.findall('link'):
                 linkref = link.find('linkclipref')
                 if linkref is None or linkref.text not in old_id_to_track:
@@ -1422,9 +1426,7 @@ def main():
                     dropped_links_dangling += 1
                     continue
                 other_track_idx = old_id_to_track[linkref.text]
-                # 同じタイムライン位置に完全一致する対応クリップだけを対応付ける
-                # (近似フォールバックはしない)。
-                target_sub_idx = find_matching_sub_idx(
+                target_sub_idx, is_approximate = find_matching_sub_idx(
                     new_clips_per_track[other_track_idx],
                     nc['new_tl_start'], nc['new_tl_end']
                 )
@@ -1432,6 +1434,8 @@ def main():
                     new_clip.remove(link)
                     dropped_links_no_exact_match += 1
                     continue
+                if is_approximate:
+                    approximated_links_unique_candidate += 1
                 linkref.text = new_id_map[(other_track_idx, target_sub_idx)]
                 clipindex_elem = link.find('clipindex')
                 if clipindex_elem is not None:
@@ -1439,15 +1443,16 @@ def main():
 
             track_elem.append(new_clip)
 
-    # オーディオ/ビデオの<link>が完全一致で解決できなかった件数を警告する。
-    # 通常のステレオ振り分け(音声チャンネルマッピング)クリップは常に完全一致
-    # するため、ここが1件でもあれば「入力側で既にリンクペアの境界が食い違って
-    # いた」ことを意味し、そのクリップのチャンネル割り当てがPremiere上で
-    # 意図通りに再現されない可能性がある (黙って近似しない代わりに、
-    # ユーザーが実機で確認すべき箇所として明示する)。
+    # <link>の解決結果を件数で報告する (何が起きたかを後から追えるようにする)。
+    # 近似接続=候補が一意だったため安全に復元できたリンク。除去=候補が無い、
+    # または複数あって一意に決められなかったリンク (曖昧なまま繋ぐと誤接続に
+    # なるため除去して警告する)。
+    if approximated_links_unique_candidate:
+        print(f"  リンク{approximated_links_unique_candidate}件を近似接続（候補が一意）"
+              " (完全一致する対応クリップは無いが、重なりを持つ候補が1つしか"
+              "無かったため、誤選択の余地が無く安全に接続しました)")
     if dropped_links_no_exact_match:
-        print(f"  WARNING: リンク{dropped_links_no_exact_match}件で対応するクリップの"
-              "位置が完全一致せず、リンクを除去しました"
+        print(f"  リンク{dropped_links_no_exact_match}件を除去（候補なし/曖昧）"
               " (元の素材でリンク済みクリップ同士の境界が食い違っていた可能性があります。"
               "ステレオ振り分け・オーディオチャンネルマッピングを使ったクリップは"
               "Premiereで Modify Clip > Audio Channels の割り当てを確認してください)")
@@ -1526,20 +1531,58 @@ def main():
 
 def find_matching_sub_idx(other_new_clips, tl_start, tl_end):
     """タイムライン位置が完全一致する対応クリップのインデックスを返す。
+    完全一致が無い場合は、重なりを持つ候補がちょうど1つのときだけ、その
+    候補へ近似接続する (誤選択の余地が原理的に無いため)。
 
-    2026-07-27: 以前あった「完全一致が無ければ最も重なりが大きいクリップへ
-    近似する」フォールバックは意図的に削除した。真にリンクされた
-    ステレオ展開ペア (音声チャンネル振り分け) は同じキープ区間の同じ位置に
-    生成されるため常に完全一致し、近似が必要になることはない。近似は
-    「別のペアの別クリップ」を誤って同一グループへリンクし、Premiereの
-    オーディオチャンネル割り当て (Modify Clip > Audio Channels) を壊す
-    リスクがある。完全一致が無ければ None を返し、呼び出し元でリンクを
-    除去・警告させる (チャンネル配線に関わる対応付けを推測しない)。
+    Returns: (index, is_approximate) のタプル。
+      - 完全一致がある: (index, False)
+      - 完全一致が無く、重なりを持つ候補が1つだけ: (index, True)
+      - 候補が0個、または2個以上で一意に決められない: (None, False)
+
+    経緯 (ead23ec, 2026-07-27): 元々あった「完全一致が無ければ最も重なりが
+    大きいクリップへ近似する」フォールバックは、ピンマイク2ch実機報告を受けて
+    一旦全廃した。真にリンクされたステレオ展開ペア (音声チャンネル振り分け)
+    は同じキープ区間の同じ位置に生成されるため常に完全一致するはずで、
+    完全一致が無い＝入力側で既にペアの境界が食い違っている、という前提の下
+    では、近似は「別ペアの別クリップ」を誤って同一リンクグループへ繋いで
+    しまう危険信号だと判断された。
+
+    その後の追加調査 (2026-07-28) で、この実機報告自体の原因はPremiereの
+    FCP XML書き出し仕様側にあり、近似フォールバックとは無関係だったと判明
+    した。一方、ead23ec の全廃には副作用があった: 実素材のカットで、末尾
+    1箇所 (映像V1のアウト点と音声A1〜A4のアウト点が50フレーム食い違っていた
+    区間) に集中して正当なリンクを12件失っていた。その12件のうち8件
+    (V1⇔A1〜A4の20フレームずれペア) は、重なりを持つ候補が常に1つしか
+    無い状況だった — つまり「どちらに繋ぐか」という選択自体が存在せず、
+    近似したとしても誤接続は原理的に起こり得なかった。残り4件は末尾0.1秒の
+    音声のみ区間で対応する映像クリップがそもそも存在せず、これは正しく
+    除去されるべきケースだった。
+
+    そこで「重なりを持つ候補がちょうど1つのときだけ」近似接続するよう緩和
+    する。候補が2つ以上あるときは (ead23ec の懸念どおり) どちらが正しい相方か
+    判断できないため、従来通り除去する。
+
+    重要 — 安全性の前提と、これを無条件近似へ戻してはいけない理由:
+    上記の「原理的に誤接続が起こらない」という結論は、今回の実データが
+    「トラックあたりクリップが1本しかない」という構造だったことに依存して
+    いる。マルチカムなど、同じキープ区間に複数クリップが並ぶ編集では
+    重なる候補が複数生まれ得るため、この安全性は証明されていない。だからこそ
+    「候補がちょうど1つ」という条件を外してはならない。ead23ec の経緯を
+    知らずに「どうせ安全なら常に最も重なりが大きい候補へ近似すればいい」と
+    無条件近似 (ead23ec 以前の実装) へ戻すのは、この安全性の前提を壊す
+    ため絶対に行わないこと。
     """
     for idx, nc in enumerate(other_new_clips):
         if nc['new_tl_start'] == tl_start and nc['new_tl_end'] == tl_end:
-            return idx
-    return None
+            return idx, False
+
+    overlapping = [
+        idx for idx, nc in enumerate(other_new_clips)
+        if min(tl_end, nc['new_tl_end']) - max(tl_start, nc['new_tl_start']) > 0
+    ]
+    if len(overlapping) == 1:
+        return overlapping[0], True
+    return None, False
 
 
 if __name__ == '__main__':
