@@ -392,6 +392,151 @@ def conform_sequence_rate(tree, sequence, declared_tb, declared_ntsc,
     return True
 
 
+def _rate_pair(rate_elem):
+    """<rate>要素から (timebase文字列, ntsc文字列'TRUE'/'FALSE') を取り出す。欠落時は None。"""
+    if rate_elem is None:
+        return None
+    tb = (rate_elem.findtext('timebase') or '').strip()
+    ntsc = (rate_elem.findtext('ntsc') or '').strip().upper()
+    if not tb or ntsc not in ('TRUE', 'FALSE'):
+        return None
+    return (tb, ntsc)
+
+
+def _rate_fps_label(pair):
+    tb, ntsc = pair
+    fps = int(tb) * 1000 / 1001 if ntsc == 'TRUE' else float(tb)
+    return f"{fps:.3f}fps"
+
+
+def conform_file_rate_to_clipitem_rate(sequence):
+    """<file>のレート宣言が、それを参照する<clipitem>のレートと食い違っている
+    ときだけ、<file>側をclipitem側へ揃える（frame番号は一切変更しない）。
+
+    背景 (2026-07-27 実機報告): プラグインの「フレームレート変更」
+    (ClipProjectItem.createSetOverrideFrameRateAction、Interpret Footage相当)
+    でProjectItemの解釈を上書きしても、Premiereの Final Cut Pro XML 書き出しは
+    その上書きを無視し、<file>側にネイティブレートをそのまま書く。一方
+    <clipitem><rate>は上書き後の解釈(=シーケンスレート)を反映するため、書き出し
+    XML内で同じ素材について矛盾する2つのレートが混在する（実測: 29.97fpsネイティブの
+    素材を30.00fpsへ上書きしたケースで、<clipitem>全3404件が30/非NTSCの一方、
+    <file>は30/NTSC=29.97fpsのまま）。このXMLをそのままカットして読み込むと、新規
+    マスタークリップが<file>側のネイティブレートで登録され、上書きが再現されない
+    (プラグインの機能が無音カットを経由すると無効化されたように見える)。
+
+    このファイル冒頭のコメント (rateは宣言値のまま変更しない方針) は「シーケンス
+    全体のレートをffprobe実測へ揃える」という別種の操作を指す。それは frame番号
+    と ticks_per_frame の基準を伴って変えるため、frame値を旧基準のまま残すと
+    実位置がズレる (過去に確認済みの不具合)。今回の操作はそれとは異なり、
+    <file>直下の3箇所のレート宣言だけを書き換え、frame・duration・in/out・
+    start/end・pproTicksは一切触らない。frameが表す「タイムライン/素材上の
+    位置」の意味は変わらないため、位置ズレは原理的に起きない。
+
+    安全側の発動条件 (どれか1つでも成立しなければ、その<file>には一切触れない):
+      1. <file>を参照する全<clipitem>の<rate>が1つの値に一致していること
+         (混在シーケンス・欠落を除外)
+      2. その全<clipitem>で out-in(素材フレーム長) == end-start(タイムライン
+         フレーム長) が厳密に成立すること (速度変更・真のフレームレート不一致
+         によるリタイムが行われている場合はここが不一致になり除外される —
+         その場合、<clipitem><rate>とファイルの食い違いは「解釈の上書き」ではなく
+         「実際に変換が起きている」ことの表れなので、ファイル宣言を書き換えると
+         実態と逆に食い違う)
+      3. 揃えるべき<clipitem>のレートと<file>のレートが実際に異なっている
+         (通常ケース=既に一致 は無変更のまま)
+
+    <file><duration> と <file><timecode><frame> はフレーム数 (レート非依存) の
+    ため変更しない。<file><timecode><string> はDF表記の表示専用文字列で
+    <frame>が正なので再計算しない (実害なし)。<displayformat>のみ、NTSC⇔非NTSC
+    反転時にDF/NDFの慣習に追随させる。
+
+    Returns: [ログ文字列 (\"[注意] ...\"形式), ...]
+    """
+    notices = []
+
+    file_defs = {}
+    for file_elem in sequence.iter('file'):
+        fid = file_elem.get('id')
+        if fid and fid not in file_defs and file_elem.find('name') is not None:
+            file_defs[fid] = file_elem
+
+    clips_by_file = {}
+    for clip in sequence.iter('clipitem'):
+        file_ref = clip.find('file')
+        if file_ref is None:
+            continue
+        fid = file_ref.get('id')
+        if fid:
+            clips_by_file.setdefault(fid, []).append(clip)
+
+    for fid, file_elem in file_defs.items():
+        clips = clips_by_file.get(fid)
+        if not clips:
+            continue
+
+        clip_rates = set()
+        safe = True
+        for clip in clips:
+            pair = _rate_pair(clip.find('rate'))
+            if pair is None:
+                safe = False
+                break
+            clip_rates.add(pair)
+
+            try:
+                in_v = int((clip.findtext('in') or '').strip())
+                out_v = int((clip.findtext('out') or '').strip())
+                start_v = int((clip.findtext('start') or '').strip())
+                end_v = int((clip.findtext('end') or '').strip())
+            except ValueError:
+                safe = False
+                break
+            if in_v < 0 or out_v < 0:
+                safe = False  # トランジション等の番兵値混在 — 判定材料が欠ける
+                break
+            if (out_v - in_v) != (end_v - start_v):
+                safe = False  # リタイム/真の不一致の可能性 — 上書きの痕跡ではない
+                break
+
+        if not safe or len(clip_rates) != 1:
+            continue
+
+        clip_rate = next(iter(clip_rates))
+        file_rate = _rate_pair(file_elem.find('rate'))
+        if file_rate is None or file_rate == clip_rate:
+            continue  # 欠落、または既に一致 (通常ケース) — 無変更
+
+        rate_targets = [
+            file_elem.find('rate'),
+            file_elem.find('timecode/rate'),
+            file_elem.find('media/video/samplecharacteristics/rate'),
+        ]
+        for r in rate_targets:
+            if r is None:
+                continue
+            tb_elem, ntsc_elem = r.find('timebase'), r.find('ntsc')
+            if tb_elem is not None:
+                tb_elem.text = clip_rate[0]
+            if ntsc_elem is not None:
+                ntsc_elem.text = clip_rate[1]
+
+        disp = file_elem.find('timecode/displayformat')
+        if disp is not None and (disp.text or '').strip().upper() in ('DF', 'NDF'):
+            disp.text = 'DF' if clip_rate[1] == 'TRUE' else 'NDF'
+
+        name = file_elem.findtext('name') or fid
+        notice = (
+            f"素材「{name}」のファイル内フレームレート宣言を "
+            f"{_rate_fps_label(file_rate)} → {_rate_fps_label(clip_rate)} に補正しました "
+            "(このシーケンスのクリップは既に補正後のレートとして配置されており、"
+            "素材のファイル宣言だけが元のネイティブレートのままだったため。"
+            "フレーム位置・durationは変更していません)"
+        )
+        print(f"  WARNING: {notice}")
+        notices.append(notice)
+
+    return notices
+
+
 def probe_media_fps_duration(path):
     """実メディアの実fpsと長さ(秒)をffprobeで取得。失敗時は(None, None)。
 
@@ -1323,6 +1468,13 @@ def main():
         print(f"  WARNING: キーフレーム付きエフェクトのクリップを分割しました: "
               f"{', '.join(sorted(keyframed))} — カット後のモーション/スケールの"
               f"見え方をPremiereで確認してください")
+
+    # <file>のレート宣言が、それを参照する<clipitem>のレートと食い違っている
+    # (=フレームレート上書き機能が使われたがFCP XML書き出しに反映されなかった)
+    # ときだけ、<file>側をclipitem側へ揃える (2026-07-27 実機報告)。
+    # frame番号は一切変更しないため、下の conform_sequence_rate とは独立に安全。
+    for notice in conform_file_rate_to_clipitem_rate(sequence):
+        print(f"[注意] {notice}")
 
     # 宣言レートがPremiereの報告する実シーケンスレートと違う場合、出力を
     # 実レートで書き直す。「30fpsのシーケンスをカットしたら29fpsで返ってきた」
