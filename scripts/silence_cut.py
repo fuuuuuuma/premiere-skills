@@ -1159,6 +1159,12 @@ def main():
             clip_counter += 1
 
     # 各トラックのクリップ置換
+    # link解決の統計 (2026-07-27 実機報告「カット後にオーディオチャンネル割り当てが
+    # 壊れる」の再発防止用)。dangling=リンク先クリップが丸ごとカットされ消滅した
+    # (想定内)。no_exact_match=リンク先トラックにクリップは残っているが位置が
+    # 完全一致しない (想定外・危険信号)。後者は必ず警告として出す。
+    dropped_links_dangling = 0
+    dropped_links_no_exact_match = 0
     for track_idx, track_info in enumerate(tracks):
         track_elem = track_info['track_elem']
 
@@ -1227,20 +1233,39 @@ def main():
             # link参照更新（対応クリップが見つからない link は要素ごと除去する。
             # 削除済みclipitem IDを残すとPremiere読み込み時にリンク解決エラーや
             # 誤バインドを起こす。mic_gate.py の全除去方針と同じ扱い）
+            #
+            # 2026-07-27 実機報告「ピンマイク2本を別チャンネルに録った素材で
+            # カット後にオーディオチャンネル割り当てが壊れる」の修正:
+            # 以前は完全一致する対応クリップが無い場合、「最も重なりが大きい
+            # クリップ」へ近似フォールバックしていた。これは別のステレオ振り分け
+            # ペア (例: 別トラックの別マイク用クリップ) を誤って同一リンクグループへ
+            # 繋いでしまう恐れがあり、Premiereインポート時に
+            # 「本来のペアが孤立し (どのソースにも繋がらない)、無関係な
+            # クリップ同士が誤って繋がる」形でオーディオチャンネル表示が
+            # 壊れる (Modify Clip > Audio Channels が「カスタム」化し、
+            # 割り当てが入れ替わる/消える)。真にリンクされたステレオ展開ペア
+            # (currentExplodedTrackIndex) は同じキープ区間から生成されるため、
+            # 正常な入力なら常に完全一致する。完全一致が無い＝入力側の時点で
+            # ペアの境界が食い違っている (カット処理の責任範囲外) ので、
+            # 近似せずリンクを除去し、警告として明示する
+            # (チャンネル配線に関わる情報は、保持できないなら黙って作り直さない)。
             for link in new_clip.findall('link'):
                 linkref = link.find('linkclipref')
                 if linkref is None or linkref.text not in old_id_to_track:
+                    # リンク先クリップが丸ごとカットされて消滅した (想定内)。
                     new_clip.remove(link)
+                    dropped_links_dangling += 1
                     continue
                 other_track_idx = old_id_to_track[linkref.text]
-                # 同じタイムライン位置の対応クリップを探す
-                # （他トラックのsub_idx数が異なる可能性があるため位置で対応付ける）
+                # 同じタイムライン位置に完全一致する対応クリップだけを対応付ける
+                # (近似フォールバックはしない)。
                 target_sub_idx = find_matching_sub_idx(
                     new_clips_per_track[other_track_idx],
                     nc['new_tl_start'], nc['new_tl_end']
                 )
                 if target_sub_idx is None:
                     new_clip.remove(link)
+                    dropped_links_no_exact_match += 1
                     continue
                 linkref.text = new_id_map[(other_track_idx, target_sub_idx)]
                 clipindex_elem = link.find('clipindex')
@@ -1248,6 +1273,19 @@ def main():
                     clipindex_elem.text = str(target_sub_idx + 1)
 
             track_elem.append(new_clip)
+
+    # オーディオ/ビデオの<link>が完全一致で解決できなかった件数を警告する。
+    # 通常のステレオ振り分け(音声チャンネルマッピング)クリップは常に完全一致
+    # するため、ここが1件でもあれば「入力側で既にリンクペアの境界が食い違って
+    # いた」ことを意味し、そのクリップのチャンネル割り当てがPremiere上で
+    # 意図通りに再現されない可能性がある (黙って近似しない代わりに、
+    # ユーザーが実機で確認すべき箇所として明示する)。
+    if dropped_links_no_exact_match:
+        print(f"  WARNING: リンク{dropped_links_no_exact_match}件で対応するクリップの"
+              "位置が完全一致せず、リンクを除去しました"
+              " (元の素材でリンク済みクリップ同士の境界が食い違っていた可能性があります。"
+              "ステレオ振り分け・オーディオチャンネルマッピングを使ったクリップは"
+              "Premiereで Modify Clip > Audio Channels の割り当てを確認してください)")
 
     # 解像度不一致クリップへのフィットスケール付与
     # (「フレームサイズに合わせる」はXML非保存のため、明示スケールが無い
@@ -1315,19 +1353,21 @@ def main():
 
 
 def find_matching_sub_idx(other_new_clips, tl_start, tl_end):
-    """タイムライン位置が重なる対応クリップのインデックスを返す"""
+    """タイムライン位置が完全一致する対応クリップのインデックスを返す。
+
+    2026-07-27: 以前あった「完全一致が無ければ最も重なりが大きいクリップへ
+    近似する」フォールバックは意図的に削除した。真にリンクされた
+    ステレオ展開ペア (音声チャンネル振り分け) は同じキープ区間の同じ位置に
+    生成されるため常に完全一致し、近似が必要になることはない。近似は
+    「別のペアの別クリップ」を誤って同一グループへリンクし、Premiereの
+    オーディオチャンネル割り当て (Modify Clip > Audio Channels) を壊す
+    リスクがある。完全一致が無ければ None を返し、呼び出し元でリンクを
+    除去・警告させる (チャンネル配線に関わる対応付けを推測しない)。
+    """
     for idx, nc in enumerate(other_new_clips):
         if nc['new_tl_start'] == tl_start and nc['new_tl_end'] == tl_end:
             return idx
-    # 完全一致がない場合、最も重なりが大きいものを返す
-    best_idx = None
-    best_overlap = 0
-    for idx, nc in enumerate(other_new_clips):
-        overlap = min(tl_end, nc['new_tl_end']) - max(tl_start, nc['new_tl_start'])
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_idx = idx
-    return best_idx
+    return None
 
 
 if __name__ == '__main__':
