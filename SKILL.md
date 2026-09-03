@@ -112,8 +112,25 @@ Premiere Pro / Whisper / ffmpeg などのローカル依存を持つため、Cap
 （非対話シェルからは `claude plugin marketplace add fuuuuuuma/premiere-skills` →
 `claude plugin install premiere-skills@premiere-skills` でも同じ）
 
-事前に上記「動作環境」の `pip3 install` / `brew install ffmpeg` が必要。インストール後は
-`/cut` `/srt-fast` としてそのまま呼べる（他プラグインと名前が衝突する場合のみ
+上記「動作環境」の `pip3 install` / `brew install ffmpeg` が無い場合、`/cut` `/srt-fast` の実行前に
+自動でチェックされ、不足があれば導入コマンドを提示したうえで確認してから進める（無断では入れない）。
+インストール後は `/cut` `/srt-fast` としてそのまま呼べる（他プラグインと名前が衝突する場合のみ
 `/premiere-skills:cut` のように明示する）。`/srt-fast` の初回セットアップで作るチャンネル設定は
 `${CLAUDE_PLUGIN_DATA}`（プラグイン更新を跨いでも残る領域）に保存され、生成物は入力ファイルと
 同じ場所に出力される。
+
+## Codex plugin としてのインストール（Codexで `/cut` `/srt-fast` を使う場合）
+
+Codex CLI（`codex`）は Claude Code plugin と同じ `.claude-plugin/marketplace.json` /
+`plugin.json` を読める。手順はClaude Codeとほぼ同じ:
+
+```
+codex plugin marketplace add fuuuuuuma/premiere-skills
+codex plugin add premiere-skills@premiere-skills
+```
+
+依存導入は上と同じくコマンド実行時に自動チェックされる。Codex では
+`${CLAUDE_PLUGIN_ROOT}`（プラグインの実パス）が展開されないため、`/cut` `/srt-fast` は
+Codex のプラグインキャッシュ（`~/.codex/plugins/cache/`）内を探して自分自身の場所を見つける。
+`/srt-fast` のチャンネル設定は `~/.codex/premiere-skills-data`（プラグイン更新を跨いでも残る
+固定の場所）に保存される。

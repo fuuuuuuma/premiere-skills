@@ -75,6 +75,10 @@ if [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/whisper_to_srt.py" ]; then
   REPO_ROOT="${CLAUDE_PLUGIN_ROOT}"
   CONFIG_DIR="${CLAUDE_PLUGIN_DATA}"
   OUT_ROOT="$(dirname "<入力の絶対パス>")"
+elif SCRIPT_HIT="$(find "$HOME/.codex/plugins/cache" -maxdepth 5 -type f -name whisper_to_srt.py -path "*/premiere-skills/*" 2>/dev/null | head -1)" && [ -n "$SCRIPT_HIT" ]; then
+  REPO_ROOT="$(cd "$(dirname "$SCRIPT_HIT")/.." && pwd)"
+  CONFIG_DIR="$HOME/.codex/premiere-skills-data"
+  OUT_ROOT="$(dirname "<入力の絶対パス>")"
 else
   REPO_ROOT="/Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills"
   CONFIG_DIR="$REPO_ROOT/config"
@@ -88,8 +92,23 @@ echo "OUT_ROOT=$OUT_ROOT"
 
 Claude Code plugin として配布された場合（`${CLAUDE_PLUGIN_ROOT}` に `scripts/whisper_to_srt.py` が
 存在する場合）は、チャンネル設定を `${CLAUDE_PLUGIN_DATA}`（アップデートを跨いで残る永続領域）に、
-生成物を入力ファイルと同じ場所に保存する。premiere-skills リポジトリを直接使っている場合（河村さんの
-開発環境）は、これまで通りリポジトリ内の `config/` と `output/` を使う。
+生成物を入力ファイルと同じ場所に保存する。**Codex plugin として配布された場合**（`${CLAUDE_PLUGIN_ROOT}`
+は展開されないため、Codex のプラグインキャッシュ内を探して見つかった場合）は、チャンネル設定を
+`~/.codex/premiere-skills-data`（プラグイン更新を跨いでも残る固定の場所）に保存する。premiere-skills
+リポジトリを直接使っている場合（河村さんの開発環境）は、これまで通りリポジトリ内の `config/` と
+`output/` を使う。
+
+## 実行前チェック（依存が無ければ確認してから導入）
+
+```bash
+MISSING=""
+command -v ffmpeg >/dev/null 2>&1 || MISSING="$MISSING ffmpeg(brew install ffmpeg)"
+python3 -c "import mlx_whisper" >/dev/null 2>&1 || python3 -c "import faster_whisper" >/dev/null 2>&1 || MISSING="$MISSING faster-whisper/mlx-whisper(pip3 install --user faster-whisper mlx-whisper)"
+[ -n "$MISSING" ] && echo "MISSING:$MISSING" || echo "MISSING:none"
+```
+
+`MISSING:none` 以外の場合は転写を実行せず、足りないものと導入コマンドをユーザーに伝え、
+今すぐ実行してよいか確認してから進める（無断で実行しない）。
 
 ### Step 0: 初回セットアップ確認（`$CONFIG_DIR/channel_profile.md` が無い場合のみ）
 

@@ -28,11 +28,20 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 
 ## 出力先
 
-**Claude Code plugin として配布された場合**（`${CLAUDE_PLUGIN_ROOT}` に `scripts/silence_cut.py` が存在する場合）は、**入力XMLと同じディレクトリの `output/cut/`** に出力する。プラグインの install 先はアップデートで差し替えられるため、そこに書き込んではいけない。
+**Claude Code / Codex plugin として配布された場合**（プラグイン同梱の `scripts/silence_cut.py` が見つかる場合）は、**入力XMLと同じディレクトリの `output/cut/`** に出力する。プラグインの install 先はアップデートで差し替えられるため、そこに書き込んではいけない。
 
 **premiere-skills リポジトリを直接使っている場合**（河村さんの開発環境）は、これまで通り**必ず premiere-skills リポジトリの `output/cut/` に出力すること**。worktree やカレントリポジトリのルートに出してはいけない（worktree から実行するとルートが worktree パスに解決され、過去のカット済みファイルと分離してしまう）。出力先は `$HOME/.claude/scripts/silence_cut.py`（premiere-skills への symlink）を `realpath` で解決して導出する。`/Users/...` のような絶対パスはハードコードしない（配布版が壊れるため）。
 
 出力ファイル名: `<入力ファイル名>_カット済み.xml`
+
+## 実行前チェック（依存が無ければ確認してから導入）
+
+```bash
+command -v ffmpeg >/dev/null 2>&1 && echo "ffmpeg: OK" || echo "ffmpeg: 未導入"
+```
+
+「未導入」の場合は無音カットを実行せず、`brew install ffmpeg` が必要である旨をユーザーに伝え、
+今すぐ実行してよいか確認してから進める（無断で実行しない）。
 
 ## 実行
 
@@ -42,6 +51,8 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 if [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/silence_cut.py" ]; then
   SCRIPT="${CLAUDE_PLUGIN_ROOT}/scripts/silence_cut.py"
   OUT_DIR="$(dirname "<XMLファイルの絶対パス>")/output/cut"
+elif SCRIPT="$(find "$HOME/.codex/plugins/cache" -maxdepth 5 -type f -name silence_cut.py -path "*/premiere-skills/*" 2>/dev/null | head -1)" && [ -n "$SCRIPT" ]; then
+  OUT_DIR="$(dirname "<XMLファイルの絶対パス>")/output/cut"
 else
   SCRIPT="$HOME/.claude/scripts/silence_cut.py"
   OUT_DIR="$(cd "$(dirname "$(realpath "$SCRIPT")")/.." && pwd)/output/cut"
@@ -50,6 +61,11 @@ python3 "$SCRIPT" \
   "<XMLファイルの絶対パス>" \
   --output-dir "$OUT_DIR"
 ```
+
+（`${CLAUDE_PLUGIN_ROOT}` は Claude Code plugin のときだけ実パスに展開される。Codex plugin では
+展開されないため、Codex のプラグインキャッシュ（`~/.codex/plugins/cache/`）内を探す2番目の分岐で
+見つける。河村さんの開発環境ではどちらも該当せず、既存の `$HOME/.claude/scripts/silence_cut.py`
+symlink 経由になる）
 
 （既定はA1のみで無音判定。ピンマイクで2人を別トラックに個別収録している場合は `--tracks A1,A2` を追加する）
 
