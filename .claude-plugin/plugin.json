@@ -1,0 +1,7 @@
+{
+  "name": "premiere-skills",
+  "description": "Premiere Pro XML の無音・雑音カット(/cut)と日本語テロップ用SRT高速生成(/srt-fast)をClaude Codeで自動化する。ローカル実行型（ffmpeg・mlx-whisper・faster-whisper が別途必要）。",
+  "version": "1.0.0",
+  "author": { "name": "fuuuuuuma" },
+  "commands": ["./commands/cut.md", "./commands/srt-fast.md"]
+}

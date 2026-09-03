@@ -8,7 +8,7 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 
 - **`--tracks` にBGMや環境音が常時鳴っているトラックを含めてしまう** → そのトラックはほぼ無音にならないため、積集合判定でカットが一切発生しなくなる。`--tracks` には人の声が入っているトラックだけを指定する
 - **A1自体にBGM/環境音が常時混入している素材** → 既定の -48dB では無音が検出できず「検出無音: 0箇所」で実質何もカットされない。まずBGM混入を疑い、`--threshold -35`〜`-40` を試す
-- **`--padding` を大きくしすぎる** → padding×2 ≥ min-silence だと全無音がパディングに食われて1フレームもカットされない（スクリプトが警告を出す）。padding は min-silence の半分未満にする
+- **パディングを大きくしすぎる** → 前後に残す量の合計 ≥ min-silence だと全無音がパディングに食われて1フレームもカットされない（スクリプトが警告を出す）。合計を min-silence 未満にする。前後を別々にしたいときは `--padding-after`（直前の発話の後ろ＝語尾の余韻）/ `--padding-before`（次の発話の前＝出だしの間）を使う。どちらも未指定なら `--padding` の値が前後同量で入る
 - **カット0件を「成功」と読み違える** → 2026-07-25以降、カット箇所0件は `exit 3`、選択したトラックの音声を1本でも取り出せなかった場合は `exit 4` で**XMLを書かずに停止**する。`[診断]` 行に実測 peak/RMS と**推奨閾値**が出るので、それを `--threshold` に渡して再実行する（旧挙動＝未カットXMLを出す、が必要な場合だけ `--allow-no-cut`）
 - **全トラックに同じin/outを適用してしまう** → トラックごとにソースオフセットが異なる。`offset = in_frame - tl_start` を個別に保持すること
 - **Bashタイムアウトを指定し忘れる** → デフォルト2分で切れる。必ず `600000`（10分）を指定
@@ -28,9 +28,9 @@ description: Premiere Pro XMLの無音・雑音を自動カットする。XMLフ
 
 ## 出力先
 
-**必ず premiere-skills リポジトリの `output/cut/` に出力すること**。
+**Claude Code plugin として配布された場合**（`${CLAUDE_PLUGIN_ROOT}` に `scripts/silence_cut.py` が存在する場合）は、**入力XMLと同じディレクトリの `output/cut/`** に出力する。プラグインの install 先はアップデートで差し替えられるため、そこに書き込んではいけない。
 
-worktree やカレントリポジトリのルートに出してはいけない（worktree から実行するとルートが worktree パスに解決され、過去のカット済みファイルと分離してしまう）。出力先は `$HOME/.claude/scripts/silence_cut.py`（premiere-skills への symlink）を `realpath` で解決して導出する。`/Users/...` のような絶対パスはハードコードしない（配布版が壊れるため）。
+**premiere-skills リポジトリを直接使っている場合**（河村さんの開発環境）は、これまで通り**必ず premiere-skills リポジトリの `output/cut/` に出力すること**。worktree やカレントリポジトリのルートに出してはいけない（worktree から実行するとルートが worktree パスに解決され、過去のカット済みファイルと分離してしまう）。出力先は `$HOME/.claude/scripts/silence_cut.py`（premiere-skills への symlink）を `realpath` で解決して導出する。`/Users/...` のような絶対パスはハードコードしない（配布版が壊れるため）。
 
 出力ファイル名: `<入力ファイル名>_カット済み.xml`
 
@@ -39,8 +39,13 @@ worktree やカレントリポジトリのルートに出してはいけない�
 確認不要。即実行する。Bashのタイムアウトは必ず **600000** を指定すること。
 
 ```bash
-SCRIPT="$HOME/.claude/scripts/silence_cut.py"
-OUT_DIR="$(cd "$(dirname "$(realpath "$SCRIPT")")/.." && pwd)/output/cut"
+if [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/silence_cut.py" ]; then
+  SCRIPT="${CLAUDE_PLUGIN_ROOT}/scripts/silence_cut.py"
+  OUT_DIR="$(dirname "<XMLファイルの絶対パス>")/output/cut"
+else
+  SCRIPT="$HOME/.claude/scripts/silence_cut.py"
+  OUT_DIR="$(cd "$(dirname "$(realpath "$SCRIPT")")/.." && pwd)/output/cut"
+fi
 python3 "$SCRIPT" \
   "<XMLファイルの絶対パス>" \
   --output-dir "$OUT_DIR"

@@ -63,9 +63,37 @@ Step 4 の `--from-text` に引き渡される（2026-07-04 追加・実走検�
 
 ## 実行手順
 
-### Step 0: 初回セットアップ確認（`config/channel_profile.md` が無い場合のみ）
+### Step -1: 実行コンテキストの解決（最初に1回だけ）
 
-`config/channel_profile.md` の存在を確認する。**存在すれば何もせず Step 1 へ**。
+以降の全ステップで使う `REPO_ROOT`（スクリプト・ルール正典の場所）・`CONFIG_DIR`（チャンネル設定の
+保存場所）・`OUT_ROOT`（生成物の保存場所）を決定する。bashの変数はステップ（bashブロック）をまたいで
+引き継がれないため、ここで出力された絶対パスの値を、以降 `$REPO_ROOT` `$CONFIG_DIR` `$OUT_ROOT` と
+書かれた箇所にそのまま埋め込んで使う。
+
+```bash
+if [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/whisper_to_srt.py" ]; then
+  REPO_ROOT="${CLAUDE_PLUGIN_ROOT}"
+  CONFIG_DIR="${CLAUDE_PLUGIN_DATA}"
+  OUT_ROOT="$(dirname "<入力の絶対パス>")"
+else
+  REPO_ROOT="/Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills"
+  CONFIG_DIR="$REPO_ROOT/config"
+  OUT_ROOT="$REPO_ROOT"
+fi
+mkdir -p "$CONFIG_DIR"
+echo "REPO_ROOT=$REPO_ROOT"
+echo "CONFIG_DIR=$CONFIG_DIR"
+echo "OUT_ROOT=$OUT_ROOT"
+```
+
+Claude Code plugin として配布された場合（`${CLAUDE_PLUGIN_ROOT}` に `scripts/whisper_to_srt.py` が
+存在する場合）は、チャンネル設定を `${CLAUDE_PLUGIN_DATA}`（アップデートを跨いで残る永続領域）に、
+生成物を入力ファイルと同じ場所に保存する。premiere-skills リポジトリを直接使っている場合（河村さんの
+開発環境）は、これまで通りリポジトリ内の `config/` と `output/` を使う。
+
+### Step 0: 初回セットアップ確認（`$CONFIG_DIR/channel_profile.md` が無い場合のみ）
+
+`$CONFIG_DIR/channel_profile.md` の存在を確認する。**存在すれば何もせず Step 1 へ**。
 **存在しなければ**、本処理に入る前にユーザーへ次を1回にまとめて質問する（全項目任意・
 「わからない/後で」でも構わないと伝える）:
 
@@ -76,10 +104,10 @@ Step 4 の `--from-text` に引き渡される（2026-07-04 追加・実走検�
 4. 半角スペースの使い方に強いこだわりがあるか（無ければ既定ルールのまま進める）
 
 回答を受けて:
-- `config/channel_profile.example.md` の書式に沿って `config/channel_profile.md` を作成
-- 固有名詞の回答があれば `config/corrections.local.json` に `{"誤認識文字列": "正規表記"}` の
-  形式（`config/corrections.example.json` 参照）で保存
-- 「この設定は次回以降も自動で使われます。追加・修正したくなったら `config/` 内のファイルを
+- `$REPO_ROOT/config/channel_profile.example.md` の書式に沿って `$CONFIG_DIR/channel_profile.md` を作成
+- 固有名詞の回答があれば `$CONFIG_DIR/corrections.local.json` に `{"誤認識文字列": "正規表記"}` の
+  形式（`$REPO_ROOT/config/corrections.example.json` 参照）で保存
+- 「この設定は次回以降も自動で使われます。追加・修正したくなったら `$CONFIG_DIR` 内のファイルを
   直接編集するか、生成のたびに気づいた誤認識を教えてください」と伝えてから Step 1 へ進む
 
 ### Step 1: 入力確認
@@ -90,7 +118,7 @@ Step 4 の `--from-text` に引き渡される（2026-07-04 追加・実走検�
 ### Step 2: 前処理（bash・単一パス転写＋テキスト分割・agentゼロ）
 
 ```
-python3 "/Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/scripts/chunk_tools/prepare_text_parts.py" "<入力の絶対パス>"
+python3 "$REPO_ROOT/scripts/chunk_tools/prepare_text_parts.py" "<入力の絶対パス>" --repo "$OUT_ROOT"
 ```
 
 **Bash タイムアウト: 600000ms（10分）必須**（GPU転写は音声長の約1/8だが長尺に備える）。
@@ -110,9 +138,10 @@ Read で `<stem>.parts.json` を取得し、**parts の数だけ Agent を同一
 転写済み全文を{n}分割したパート {idx}/{n} を担当します。あなたの仕事は改行だけです。
 
 ## Step 1: ルール正典を読む（必須・全ルール厳守）
-Read: /Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/references/srt_runtime_rules.md
-Read: /Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/config/channel_profile.md
-（存在すれば。無ければスキップしてよい。存在すればそこに書かれたチャンネル固有の表記・目標値を優先する）
+Read: {REPO_ROOT}/references/srt_runtime_rules.md
+Read: {CONFIG_DIR}/channel_profile.md
+（存在すれば。無ければスキップしてよい。存在すればそこに書かれたチャンネル固有の表記・目標値を優先する。
+{REPO_ROOT} {CONFIG_DIR} は Step -1 で解決した絶対パスに置き換える）
 
 ## Step 2: 担当パート全文を読む
 Read: {parts[i].path}
@@ -145,7 +174,7 @@ for p in m['parts']:
     lines += [l.strip() for l in Path(p['lines_out']).read_text().splitlines() if l.strip()]
 Path(m['lines_out']).write_text('\n'.join(lines)+'\n')
 print(len(lines), 'lines')
-" && SRT_QA_JSON=1 python3 "/Users/kawamurafuushin/ClaudeCode/projects/常時運用/premiere-skills/scripts/whisper_to_srt.py" \
+" && SRT_QA_JSON=1 python3 "$REPO_ROOT/scripts/whisper_to_srt.py" \
   --from-text "<stem>.fast.lines.txt" --segments "<stem>.segments.json" -o "<stem>.fast.srt"
 ```
 

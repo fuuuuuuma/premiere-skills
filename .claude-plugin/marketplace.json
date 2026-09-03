@@ -1,0 +1,8 @@
+{
+  "name": "premiere-skills",
+  "description": "Premiere Pro 動画編集ワークフローを Claude Code で自動化するスキル集（/cut・/srt-fast）",
+  "owner": { "name": "fuuuuuuma" },
+  "plugins": [
+    { "name": "premiere-skills", "source": "./" }
+  ]
+}
