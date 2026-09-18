@@ -31,6 +31,7 @@ _WINDOWS_DRIVE_PATHURL_RE = re.compile(r"^/[A-Za-z]:")
 # 終了コード (呼び出し元が原因で分岐できるようにする。1=汎用エラー・2=argparse)
 EXIT_NO_CUT = 3          # 無音・カット区間が1つも無い (成功扱いにしない)
 EXIT_AUDIO_FAILED = 4    # 基準トラックの音声を1クリップも解析できなかった
+EXIT_VIDEO_DROPPED = 5   # 書き出しXMLに映像クリップが入っていない (マルチカム)
 
 
 class AudioAnalysisError(RuntimeError):
@@ -157,6 +158,328 @@ def resolve_file_path(clip, file_id_map):
     if fid and fid in file_id_map:
         return file_id_map[fid]
     return None
+
+
+# 音声の実体パスにたどり着けないクリップの内訳。呼び出し元は種別ごとに
+# 件数を数えて診断へ出す。「読めなかった」だけでは利用者はどれを直せばよいか
+# 分からない (リンク切れとネストでは次の一手が全く違う) ため、必ず種別まで出す。
+UNRESOLVED_NEST = "nest"
+UNRESOLVED_MULTICAM = "multicam"
+UNRESOLVED_LINK = "link"
+UNRESOLVED_UNKNOWN = "unknown"
+
+UNRESOLVED_LABELS = {
+    UNRESOLVED_NEST: "ネストシーケンス",
+    UNRESOLVED_MULTICAM: "マルチカム",
+    UNRESOLVED_LINK: "リンク切れ・音声の実体なし",
+    UNRESOLVED_UNKNOWN: "音声の参照なし",
+}
+
+
+MAX_NEST_DEPTH = 3  # ネストの入れ子。実務でこれ以上は想定しない (無限再帰の保険)
+
+
+def build_sequence_def_map(root):
+    """sequence id → 完全定義 (<media> を持つ要素)。
+
+    <file> と同じ書き方で、完全な定義は文書中に1つだけ書かれ、他の参照は
+    中身が空の <sequence id="..."/> になる (2026-08-02 実データで確認)。
+    音声トラック側のクリップは空参照しか持たないことが多いので、
+    ID で引けるようにしておかないと実体へたどり着けない。
+    """
+    seq_map = {}
+    for seq in root.iter('sequence'):
+        sid = seq.get('id')
+        if sid and sid not in seq_map and seq.find('media') is not None:
+            seq_map[sid] = seq
+    return seq_map
+
+
+def _rate_fps(rate_elem, fallback):
+    """<rate> から実効fpsを取る。timebase と ntsc の組み合わせは既存の
+    clip_declared_fps と同じ規則 (NTSC なら 1000/1001 を掛ける)。"""
+    if rate_elem is None:
+        return fallback
+    tb_text = rate_elem.findtext('timebase')
+    if not tb_text:
+        return fallback
+    try:
+        tb = float(tb_text)
+    except ValueError:
+        return fallback
+    if tb <= 0:
+        return fallback
+    ntsc = (rate_elem.findtext('ntsc') or '').strip().upper() == 'TRUE'
+    return tb * 1000.0 / 1001.0 if ntsc else tb
+
+
+def expand_nested_audio(clip_elem, clip_fps, seq_def_map, file_id_map, depth=0):
+    """ネスト/マルチカムのクリップを、内側の実ファイルの解析区間へ展開する。
+
+    戻り値: {'cameras': [{'filepath': str, 'segments': [...]}, ...],
+             'truncated': bool}  展開できなければ None。
+
+    segments の各要素:
+      src_start … 実ファイル内の解析開始秒
+      dur       … 解析する長さ (秒)
+      rel_start … 外側クリップの in 位置から数えた相対秒
+                  (呼び出し元が tl_start + rel*timebase でタイムラインへ戻す)
+
+    「カメラ」= 内側で参照している実ファイル単位。マルチカムの各カメラは
+    ステレオ展開で2トラックに分かれるが、どちらも同じファイルの同じ範囲を
+    指すので、ファイル単位に畳めば ffmpeg 抽出が半分で済む。
+
+    時間はすべて秒で計算する。外側59fps / 内側4fps のように宣言レートが
+    桁違いになる実例 (可変フレームレートの画面収録をマルチカム化したもの) が
+    あり、フレーム数のまま換算すると後半ほどズレるため。
+    """
+    if depth >= MAX_NEST_DEPTH:
+        return {'cameras': [], 'truncated': True}
+    seq_ref = clip_elem.find('sequence')
+    if seq_ref is None:
+        return None
+    inner = seq_ref if seq_ref.find('media') is not None else None
+    if inner is None:
+        inner = seq_def_map.get(seq_ref.get('id'))
+    if inner is None:
+        return None
+
+    inner_fps = _rate_fps(inner.find('rate'), None)
+    if not inner_fps:
+        return None
+
+    # 外側クリップが内側シーケンスのどこを再生しているか (内側シーケンスの秒)
+    try:
+        win_start = int(clip_elem.find('in').text) / clip_fps
+        win_end = int(clip_elem.find('out').text) / clip_fps
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if win_end <= win_start:
+        return None
+
+    audio_elem = inner.find('./media/audio')
+    if audio_elem is None:
+        return {'cameras': [], 'truncated': False}
+
+    by_file = {}
+    order = []
+    truncated = False
+    for track_elem in audio_elem.findall('track'):
+        for inner_clip in track_elem.findall('clipitem'):
+            enabled = (inner_clip.findtext('enabled') or 'TRUE').strip().upper()
+            if enabled != 'TRUE':
+                continue
+            try:
+                j_start = int(inner_clip.find('start').text) / inner_fps
+                j_end = int(inner_clip.find('end').text) / inner_fps
+                j_in_frame = int(inner_clip.find('in').text)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            # 内側クリップ自身の宣言レート (内側シーケンスと違うことがある)
+            j_fps = _rate_fps(inner_clip.find('rate'), inner_fps) or inner_fps
+            s0 = max(j_start, win_start)
+            s1 = min(j_end, win_end)
+            if s1 - s0 <= 0:
+                continue
+
+            path = resolve_file_path(inner_clip, file_id_map)
+            if not path:
+                # 入れ子のネスト。1段深く降りる
+                deeper = expand_nested_audio(
+                    inner_clip, j_fps, seq_def_map, file_id_map, depth + 1)
+                if deeper is None:
+                    continue
+                truncated = truncated or deeper['truncated']
+                for cam in deeper['cameras']:
+                    bucket = by_file.setdefault(cam['filepath'], [])
+                    if cam['filepath'] not in order:
+                        order.append(cam['filepath'])
+                    for seg in cam['segments']:
+                        # 内側の相対秒を、さらに外側の相対秒へ積み上げる
+                        inner_abs = j_start + seg['rel_start']
+                        if not (win_start <= inner_abs < win_end):
+                            continue
+                        bucket.append({
+                            'src_start': seg['src_start'],
+                            'dur': min(seg['dur'], win_end - inner_abs),
+                            'rel_start': inner_abs - win_start,
+                        })
+                continue
+
+            src_start = j_in_frame / j_fps + (s0 - j_start)
+            seg = {'src_start': src_start, 'dur': s1 - s0, 'rel_start': s0 - win_start}
+            if path not in by_file:
+                by_file[path] = []
+                order.append(path)
+            # 同一ファイル・同一範囲の重複 (ステレオ展開ペア) は畳む
+            if not any(abs(e['src_start'] - seg['src_start']) < 1e-6
+                       and abs(e['rel_start'] - seg['rel_start']) < 1e-6
+                       for e in by_file[path]):
+                by_file[path].append(seg)
+
+    cameras = [{'filepath': p, 'segments': by_file[p]} for p in order if by_file[p]]
+    return {'cameras': cameras, 'truncated': truncated}
+
+
+# 音声クリップからは復元しない要素 (音声固有・映像側に付けると壊れる)
+_AUDIO_ONLY_TAGS = {"sourcetrack", "outputchannelindex"}
+_VIDEO_CLIP_ORDER = (
+    "masterclipid", "name", "enabled", "duration", "rate",
+    "start", "end", "in", "out", "pproTicksIn", "pproTicksOut",
+    "alphatype", "pixelaspectratio", "anamorphic",
+)
+
+
+def reconstruct_dropped_video_clips(sequence):
+    """書き出されなかった映像クリップを、対になる音声クリップから復元する。
+
+    Premiere の Final Cut Pro XML 書き出しは、マルチカムのクリップの映像側を
+    出力しない (音声側の <link mediatype=video> だけが残り、参照先の
+    <clipitem> が文書に存在しない — 2026-08-02 実データで確認)。
+
+    マルチカムは映像と音声が同じネストシーケンスを同じ時間範囲で参照する
+    A/Vリンクのクリップなので、**音声クリップの時間情報をそのまま映像側へ
+    写せば、Premiereが書き出すはずだった映像クリップを再現できる**。
+    参照先のネストシーケンス定義は音声クリップ側に入っているため、
+    それを深いコピーで映像クリップへ持たせる (Premiere自身がネストを
+    書き出すときと同じ形)。
+
+    復元できなかったものは呼び出し元が fail-closed で止める。
+    戻り値: (復元した件数, 復元できなかった参照ID)
+    """
+    ids = {c.get("id") for c in sequence.iter("clipitem")}
+    video_elem = sequence.find("./media/video")
+    if video_elem is None:
+        return 0, sorted({
+            (l.findtext("linkclipref") or "").strip()
+            for l in sequence.iter("link")
+            if (l.findtext("mediatype") or "").strip().lower() == "video"
+            and (l.findtext("linkclipref") or "").strip() not in ids
+        } - {""})
+
+    video_tracks = video_elem.findall("track")
+    made = 0
+    failed = []
+    # 同じ映像クリップを指す音声クリップが複数 (L/R) あるので、1回だけ作る
+    handled = set()
+    for audio_clip in sequence.findall("./media/audio/track/clipitem"):
+        for link in audio_clip.findall("link"):
+            if (link.findtext("mediatype") or "").strip().lower() != "video":
+                continue
+            ref = (link.findtext("linkclipref") or "").strip()
+            if not ref or ref in ids or ref in handled:
+                continue
+            seq_ref = audio_clip.find("sequence")
+            if seq_ref is None:
+                # ネストを参照していないクリップは復元材料が無い
+                failed.append(ref)
+                handled.add(ref)
+                continue
+            try:
+                track_index = int(link.findtext("trackindex") or "1")
+            except ValueError:
+                track_index = 1
+            while len(video_tracks) < track_index:
+                video_elem.append(ET.Element("track"))
+                video_tracks = video_elem.findall("track")
+            target_track = video_tracks[track_index - 1]
+
+            new_clip = ET.Element("clipitem", {"id": ref})
+            for tag in _VIDEO_CLIP_ORDER:
+                src = audio_clip.find(tag)
+                if src is not None:
+                    new_clip.append(copy.deepcopy(src))
+            # 参照先のネスト定義。音声側が空参照しか持たない場合は、
+            # 文書内の完全定義を探して持たせる。
+            definition = seq_ref if seq_ref.find("media") is not None else None
+            if definition is None:
+                for cand in sequence.iter("sequence"):
+                    if cand.get("id") == seq_ref.get("id") and cand.find("media") is not None:
+                        definition = cand
+                        break
+            new_clip.append(copy.deepcopy(definition if definition is not None else seq_ref))
+            for l in audio_clip.findall("link"):
+                new_clip.append(copy.deepcopy(l))
+            labels = audio_clip.find("labels")
+            if labels is not None:
+                new_clip.append(copy.deepcopy(labels))
+            # <enabled> が無い音声クリップでも映像側は有効にしておく
+            if new_clip.find("enabled") is None:
+                en = ET.SubElement(new_clip, "enabled")
+                en.text = "TRUE"
+
+            target_track.insert(0, new_clip)
+            ids.add(ref)
+            handled.add(ref)
+            made += 1
+    return made, sorted(set(failed))
+
+
+def find_dropped_video_links(sequence):
+    """「映像クリップが書き出されていない」証拠を数える。
+
+    2026-08-02 実測: マルチカムのクリップを載せたシーケンスを Premiere が
+    Final Cut Pro XML へ書き出すと、**映像側の <clipitem> がまるごと出力
+    されない**。音声側のクリップには <link mediatype=video> が残るのに、
+    その linkclipref が指す <clipitem> は文書のどこにも存在しない。
+    映像トラックは <enabled>/<locked> だけの空になる。
+
+    この状態でカットすると「音声だけのシーケンス」が出来上がる。XMLに映像が
+    無い以上こちらでは復元できないので、気づかず進めずに止めるための検出。
+
+    音声だけのシーケンス (音楽編集など) を巻き込まないよう、判定は
+    「実体の無い映像リンク参照がある」ことだけを根拠にする。
+    """
+    ids = {c.get('id') for c in sequence.iter('clipitem')}
+    dangling = set()
+    for link in sequence.iter('link'):
+        if (link.findtext('mediatype') or '').strip().lower() != 'video':
+            continue
+        ref = (link.findtext('linkclipref') or '').strip()
+        if ref and ref not in ids:
+            dangling.add(ref)
+    return sorted(dangling)
+
+
+def format_unresolved_breakdown(kinds):
+    """種別→件数 を診断行の本文にする (件数の多い順)。
+
+    書式は cut_job.py が機械的に読み取る契約。ラベル表記が食い違うと
+    パネルへ届かなくなるため、test_cut_nested_sources.py が両者を照合する。
+    """
+    if not kinds:
+        return ""
+    parts = sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))
+    return " / ".join(f"{UNRESOLVED_LABELS.get(k, k)} {n}本" for k, n in parts)
+
+
+def merge_unresolved_kinds(into, more):
+    for k, n in (more or {}).items():
+        into[k] = into.get(k, 0) + n
+    return into
+
+
+def classify_unresolved_source(clip_elem):
+    """<file> から音声の実体パスを引けなかったクリップの理由を判定する。
+
+    FCP XML では、ネストしたシーケンスは <clipitem> の中に <sequence> を丸ごと
+    入れる形で書かれ、実ファイルの参照は一段深いところにある。マルチカムは
+    FCP7 スキーマの <multiclip> を持つ。どちらも <clipitem> 直下に音声の実体が
+    無いので、素材ファイルを直接見る現在の解析では扱えない。
+
+    マルチカムはネストを内包することがあるので、先に判定する。
+    """
+    if clip_elem is None:
+        return UNRESOLVED_UNKNOWN
+    if clip_elem.find('.//multiclip') is not None:
+        return UNRESOLVED_MULTICAM
+    if clip_elem.find('sequence') is not None:
+        return UNRESOLVED_NEST
+    if clip_elem.find('file') is not None:
+        # <file> はあるのに pathurl も id 参照も解決できない
+        # = 実体を失っている (リンク切れ) か、実体を持たない素材
+        return UNRESOLVED_LINK
+    return UNRESOLVED_UNKNOWN
 
 
 def build_file_video_dims(root):
@@ -620,7 +943,12 @@ def detect_silence_envelope(audio_file, start_sec, duration_sec,
         '-vn', '-ac', '1', '-ar', str(sr),
         '-f', 's16le', '-'
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+    except FileNotFoundError:
+        raise AudioAnalysisError(
+            "ffmpeg コマンドが見つかりません。PATH を確認するか、'brew install ffmpeg' でインストールしてください。"
+        )
     if proc.returncode != 0:
         detail = (proc.stderr or b'').decode('utf-8', 'replace').strip()
         raise AudioAnalysisError(
@@ -693,8 +1021,69 @@ def _clip_coverage_intervals(clips, lo, hi):
     return merge_intervals(ivs)
 
 
+def analyze_nested_clip(clip, label, ci, timebase, threshold_db, min_silence,
+                        multicam_audio, levels_acc):
+    """ネスト/マルチカムのクリップを解析し、無音区間 (タイムラインframe) を返す。
+
+    内側に複数のカメラ (= 別々の実ファイル) があるとき、どのカメラの音が
+    実際に使われているかは XML から判定できない (sourcetrack は出力チャンネルの
+    L/R を指すだけでカメラの選択ではない)。そのため既定は安全側に倒し、
+    全カメラが同時に無音の区間だけを無音とする。
+      multicam_audio == 'all'   → 全カメラの積集合 (既定・発話を誤って削らない)
+      multicam_audio == 'first' → 先頭カメラだけを基準にする
+
+    クリップが乗っていない区間 (内側の隙間) はそのカメラにとって無音として扱う。
+    """
+    cameras = (clip.get('nested') or {}).get('cameras') or []
+    if not cameras:
+        return None
+    if multicam_audio == 'first':
+        cameras = cameras[:1]
+
+    lo, hi = clip['tl_start'], clip['tl_end']
+    per_camera = []
+    for cam in cameras:
+        cam_silences = []
+        coverage = []
+        for seg in cam['segments']:
+            if seg['dur'] <= 0:
+                continue
+            silences, levels = detect_silence_envelope(
+                cam['filepath'], seg['src_start'], seg['dur'],
+                threshold_db, min_silence)
+            seg_lo = max(lo, lo + int(round(seg['rel_start'] * timebase)))
+            seg_hi = min(hi, lo + int(round((seg['rel_start'] + seg['dur']) * timebase)))
+            if seg_hi > seg_lo:
+                coverage.append((seg_lo, seg_hi))
+            for s_start, s_end in silences:
+                tf_start = max(lo + int(round(
+                    (seg['rel_start'] + (s_start - seg['src_start'])) * timebase)), seg_lo)
+                tf_end = min(lo + int(round(
+                    (seg['rel_start'] + (s_end - seg['src_start'])) * timebase)), seg_hi)
+                if tf_end > tf_start:
+                    cam_silences.append((tf_start, tf_end))
+            # 診断値はカメラをまたいで積み上げる (どのカメラも実測に寄与している)
+            if levels['peakDb'] is not None:
+                levels_acc['peakDb'] = (levels['peakDb'] if levels_acc['peakDb'] is None
+                                        else max(levels_acc['peakDb'], levels['peakDb']))
+            if levels['rmsDb'] is not None and levels['seconds'] > 0:
+                levels_acc['energy'] += (10 ** (levels['rmsDb'] / 10.0)) * levels['seconds']
+            levels_acc['seconds'] += levels['seconds']
+            levels_acc['quietSeconds'] += levels['quietRatio'] * levels['seconds']
+            if levels['suggestDb'] is not None:
+                levels_acc['suggestDb'] = (
+                    levels['suggestDb'] if levels_acc['suggestDb'] is None
+                    else min(levels_acc['suggestDb'], levels['suggestDb']))
+        # 内側にクリップが無い区間は、そのカメラにとっては音が無い = 無音
+        gaps = invert_intervals(merge_intervals(coverage), lo, hi)
+        per_camera.append(merge_intervals(cam_silences + gaps))
+        print(f"    {label}クリップ{ci+1}: {os.path.basename(cam['filepath'])}"
+              f" — 無音 {len(per_camera[-1])}箇所")
+    return intersect_all(per_camera) if per_camera else []
+
+
 def analyze_track_silence(track_info, timebase, threshold_db, min_silence,
-                          min_silence_frames, probe_cache):
+                          min_silence_frames, probe_cache, multicam_audio='all'):
     """1トラック分の全クリップを解析し、(無音区間リスト, 統計dict) を返す。
 
     区間リストはクリップ**内**で検出した無音のみ (タイムラインframe、半開区間、
@@ -710,6 +1099,7 @@ def analyze_track_silence(track_info, timebase, threshold_db, min_silence,
     silence_intervals = []
     analyzed_count = 0
     skipped_reasons = []
+    unresolved_kinds = {}
     peak_db = None
     energy = 0.0
     seconds = 0.0
@@ -718,15 +1108,54 @@ def analyze_track_silence(track_info, timebase, threshold_db, min_silence,
 
     for ci, clip in enumerate(track_info['clips']):
         audio_file = clip['filepath']
+        if not audio_file and (clip.get('nested') or {}).get('cameras'):
+            # ネスト/マルチカム: 内側の実ファイルまで降りて解析する
+            cams = clip['nested']['cameras']
+            print(f"  {label} クリップ{ci+1}: ネスト/マルチカム"
+                  f" (内側の素材 {len(cams)}本"
+                  + (" / 先頭のみ使用" if multicam_audio == 'first' and len(cams) > 1 else "")
+                  + ")")
+            acc = {'peakDb': None, 'energy': 0.0, 'seconds': 0.0,
+                   'quietSeconds': 0.0, 'suggestDb': None}
+            try:
+                nested_silences = analyze_nested_clip(
+                    clip, label, ci, timebase, threshold_db, min_silence,
+                    multicam_audio, acc)
+            except AudioAnalysisError as exc:
+                print(f"\nERROR: ネスト内の音声抽出に失敗しました ({label}クリップ{ci+1})")
+                print(f"  〖症状〗{exc}")
+                print("  〖なぜ〗ネスト/マルチカムの中で参照している素材を"
+                      "ffmpegが読み出せませんでした (リンク切れ・未対応コーデック・破損)")
+                print("  〖次の一手〗①ネストの中を開いて素材のリンク切れ(?マーク)を確認"
+                      " ②該当素材がPremiereで再生できるか確認")
+                print(f"[診断] 音声抽出に失敗したトラック: {label}")
+                sys.exit(EXIT_AUDIO_FAILED)
+            analyzed_count += 1
+            if acc['peakDb'] is not None:
+                peak_db = acc['peakDb'] if peak_db is None else max(peak_db, acc['peakDb'])
+            energy += acc['energy']
+            seconds += acc['seconds']
+            quiet_seconds += acc['quietSeconds']
+            if acc['suggestDb'] is not None:
+                suggest_db = (acc['suggestDb'] if suggest_db is None
+                              else min(suggest_db, acc['suggestDb']))
+            for tf_start, tf_end in (nested_silences or []):
+                if tf_end - tf_start >= min_silence_frames:
+                    silence_intervals.append((tf_start, tf_end))
+            continue
         if not audio_file:
-            # <file> を持たないクリップ (ネストシーケンス・マルチカム・
-            # 合成クリップ等)。音声の実体パスが無いので解析できない。
+            # 音声の実体パスへたどり着けないクリップ。理由は1つではないので
+            # 種別まで判定して伝える (ネストなら解除、リンク切れなら再リンクと、
+            # 次の一手が全く違う。「読めません」だけでは利用者が動けない)。
+            kind = classify_unresolved_source(clip.get('clip_elem'))
+            unresolved_kinds[kind] = unresolved_kinds.get(kind, 0) + 1
             skipped_reasons.append(
-                f"{label}クリップ{ci+1}: 音声ファイルの参照がありません "
-                f"(ネストシーケンス・マルチカム等はカットの基準にできません)")
+                f"{label}クリップ{ci+1}: {UNRESOLVED_LABELS[kind]} "
+                f"— 音声の実体ファイルが無いためカットの基準にできません")
             print(f"  WARNING: {skipped_reasons[-1]}")
             continue
         if not os.path.exists(audio_file):
+            unresolved_kinds[UNRESOLVED_LINK] = unresolved_kinds.get(UNRESOLVED_LINK, 0) + 1
             skipped_reasons.append(
                 f"{label}クリップ{ci+1}: 音声ファイルが見つかりません "
                 f"({audio_file}) — 素材の移動・リンク切れの可能性")
@@ -817,6 +1246,7 @@ def analyze_track_silence(track_info, timebase, threshold_db, min_silence,
         'clipCount': len(track_info['clips']),
         'analyzedCount': analyzed_count,
         'skippedReasons': skipped_reasons,
+        'unresolvedKinds': unresolved_kinds,
         'peakDb': peak_db,
         'rmsDb': rms_db,
         'quietRatio': quiet_ratio,
@@ -882,7 +1312,15 @@ def main():
     parser.add_argument("--min-silence", type=float, default=0.2,
                         help="無音と判定する最小秒数。大きくすると短い間(ま)を残す")
     parser.add_argument("--padding", type=int, default=2,
-                        help="カット前後に残すパディングフレーム数")
+                        help="カット前後に残すパディングフレーム数 (前後同量)。"
+                             "--padding-after / --padding-before を指定すると"
+                             "その側だけこちらより優先される")
+    parser.add_argument("--padding-after", type=int, default=None,
+                        help="直前の発話の「後ろ」に残すフレーム数 (語尾の余韻)。"
+                             "未指定なら --padding と同じ")
+    parser.add_argument("--padding-before", type=int, default=None,
+                        help="次の発話の「前」に残すフレーム数 (出だしの間)。"
+                             "未指定なら --padding と同じ")
     parser.add_argument("--sequence-timebase", type=int, default=None,
                         help="Premiereが報告するシーケンスの真のtimebase。書き出しXMLの"
                              "宣言値と食い違う場合、出力はこちらの値で書き直す"
@@ -890,6 +1328,10 @@ def main():
     parser.add_argument("--sequence-ntsc", default=None,
                         choices=["TRUE", "FALSE", "true", "false"],
                         help="--sequence-timebase と対で使うNTSCフラグ")
+    parser.add_argument("--multicam-audio", default="all", choices=["all", "first"],
+                        help="マルチカム/ネストの中に複数の素材があるときの無音判定基準。"
+                             "all=全部が同時に無音の区間だけ切る (既定・安全側)、"
+                             "first=先頭の素材だけを基準にする")
     parser.add_argument("--allow-no-cut", action="store_true",
                         help="カット箇所が0件でも、そのままXMLを出力して正常終了する。"
                              "既定はエラー終了 (無音が1件も見つからないのに"
@@ -921,7 +1363,12 @@ def main():
 
     THRESHOLD_DB = args.threshold
     MIN_SILENCE = args.min_silence
-    PADDING_FRAMES = args.padding
+    # パディングは前後で別々に指定できる (未指定側は --padding へフォールバック＝
+    # 従来どおり前後同量)。無音区間 [start, end] の start は「直前の発話が終わった
+    # 瞬間」、end は「次の発話が始まる瞬間」なので、start側に残す量＝語尾の余韻
+    # (after)、end側に残す量＝出だしの間 (before) になる。
+    PADDING_AFTER = args.padding if args.padding_after is None else args.padding_after
+    PADDING_BEFORE = args.padding if args.padding_before is None else args.padding_before
 
     print("=" * 60)
     print("音声トラックベース 無音カット（全トラック同期）")
@@ -930,7 +1377,8 @@ def main():
     print(f"出力: {output_xml}")
     print(f"判定トラック: {'+'.join(TRACK_LABELS)}"
           f"{' (複数トラックの積集合＝全て同時に無音の区間だけカット)' if len(TRACK_LABELS) > 1 else ''}")
-    print(f"閾値: {THRESHOLD_DB}dB | 最小無音: {MIN_SILENCE}s | パディング: {PADDING_FRAMES}f")
+    print(f"閾値: {THRESHOLD_DB}dB | 最小無音: {MIN_SILENCE}s"
+          f" | パディング: 後{PADDING_AFTER}f・前{PADDING_BEFORE}f")
 
     # ── XML解析 ──
     print("\n[1/4] XML解析...")
@@ -949,6 +1397,38 @@ def main():
         print(f"  WARNING: <sequence>が{len(sequences)}個あります。"
               f"clipitem最多の '{name}' を編集対象に選択")
 
+    # 映像クリップが書き出されていないシーケンス (マルチカム) は、解析へ進む前に
+    # 止める。数分かけて音声を解析した末に「音声だけのシーケンス」を出すのは
+    # 利用者にとって最悪の失敗なので、最初に検出する。
+    dropped_video = find_dropped_video_links(sequence)
+    if dropped_video:
+        # まずは復元を試みる。マルチカムは映像と音声が同じネストシーケンスを
+        # 同じ時間範囲で参照するA/Vリンクなので、音声側から映像側を再現できる。
+        made, still_failed = reconstruct_dropped_video_clips(sequence)
+        if made:
+            print(f"  WARNING: 書き出しXMLに映像クリップが無かったため、"
+                  f"対になる音声クリップから {made}件 復元しました "
+                  f"(Premiereのマルチカム書き出しは映像側を出力しないため)")
+            print(f"[注意] マルチカムの映像クリップ {made}件 をXMLから復元しました"
+                  " → カット後のシーケンスで映像がずれていないか確認してください")
+        dropped_video = still_failed if made else dropped_video
+    if dropped_video:
+        print("\nERROR: 書き出したXMLに映像クリップが入っていません")
+        print(f"  〖症状〗音声クリップは {len(dropped_video)}件の映像クリップと"
+              "リンクしていますが、その映像クリップがXMLのどこにも書き出されていません"
+              f" (参照だけが残っています: {', '.join(dropped_video[:3])}"
+              f"{' ほか' if len(dropped_video) > 3 else ''})")
+        print("  〖なぜ〗Premiereの Final Cut Pro XML 書き出しは、"
+              "マルチカムのクリップの映像側を出力しません。"
+              "このまま処理すると音声だけのシーケンスが出来上がります"
+              " (XMLに映像が無いため、こちらでは復元できません)")
+        print("  〖次の一手〗①タイムラインでマルチカムのクリップを右クリックし"
+              "「マルチカメラ」→「フラット化」してから実行する"
+              " ②または、使うカメラを確定させてからネスト化して実行する"
+              " (ネストは映像も書き出されるのでそのままカットできます)")
+        print(f"[診断] 書き出されなかった映像クリップ: {len(dropped_video)}件")
+        sys.exit(EXIT_VIDEO_DROPPED)
+
     # シーケンス直下の<rate>を最優先で読む。'.//rate' の文書順先頭は、実XMLの
     # 形によっては<timecode>やクリップ側のrateを掴み、非30fpsでの全カット位置
     # ズレ (30fps前提に見える壊れ方) の温床になる。
@@ -960,17 +1440,21 @@ def main():
     timebase = tb * 1000 / 1001 if ntsc else tb
     ticks_per_frame = int(TICKS_PER_SECOND / timebase)
     min_silence_frames = max(1, int(round(MIN_SILENCE * timebase)))
-    if PADDING_FRAMES * 2 >= min_silence_frames:
-        print(f"WARNING: --padding({PADDING_FRAMES}f)×2 が --min-silence"
+    if PADDING_AFTER + PADDING_BEFORE >= min_silence_frames:
+        print(f"WARNING: 前後に残す量の合計 (後{PADDING_AFTER}f + 前{PADDING_BEFORE}f"
+              f" = {PADDING_AFTER + PADDING_BEFORE}f) が --min-silence"
               f"({MIN_SILENCE}s={min_silence_frames}f) 以上のため、検出した無音が"
               f"すべてパディングに食われて1フレームもカットされません。"
-              f"padding を min-silence の半分未満にしてください")
+              f"合計を min-silence 未満にしてください")
 
     seq_duration = int(sequence.find('duration').text)
     print(f"  タイムベース: {timebase:.4f}fps")
     print(f"  シーケンス長: {seq_duration}f ({seq_duration/timebase:.1f}s, {seq_duration/timebase/60:.1f}min)")
 
     file_id_map = build_file_id_map(root)
+    # ネスト/マルチカムの完全定義を id で引けるようにしておく
+    # (音声トラック側のクリップは中身が空の <sequence id="..."/> しか持たない)
+    seq_def_map = build_sequence_def_map(root)
 
     # ── トラック情報収集（複数クリップ対応） ──
     print("\n[2/4] トラック情報収集...")
@@ -1006,6 +1490,12 @@ def main():
                 # 素材内の開始時刻(秒)。無音検出はこの実時間軸で行う。
                 in_sec = in_frame / clip_fps
                 filepath = resolve_file_path(clip, file_id_map)
+                # 実ファイルを直接持たないクリップ (ネスト・マルチカム) は、
+                # 内側のシーケンスを降りて実体の解析区間へ展開する。
+                nested = None
+                if not filepath and media_type == 'audio':
+                    nested = expand_nested_audio(
+                        clip, clip_fps, seq_def_map, file_id_map)
                 enabled = clip.find('enabled')
                 is_enabled = enabled is not None and enabled.text.upper() == 'TRUE'
 
@@ -1029,6 +1519,7 @@ def main():
                     'src_per_tl': src_per_tl,
                     'in_sec': in_sec,
                     'filepath': filepath,
+                    'nested': nested,
                     'enabled': is_enabled,
                     'real_fps': real_fps,
                     'media_dur': media_dur,
@@ -1085,6 +1576,7 @@ def main():
     per_track_stats = []       # トラックごとの診断値 (複数トラック時のみ出力)
     track_silence_sets = []    # 各トラックの無音区間 (積集合の入力)
     all_skipped_reasons = []
+    all_unresolved_kinds = {}
     total_analyzed = 0
     total_clip_count = 0
     combined_peak_db = None
@@ -1097,7 +1589,7 @@ def main():
         if label in missing_labels:
             per_track_stats.append({
                 'label': label, 'missing': True, 'clipCount': 0,
-                'analyzedCount': 0, 'skippedReasons': [],
+                'analyzedCount': 0, 'skippedReasons': [], 'unresolvedKinds': {},
                 'peakDb': None, 'rmsDb': None, 'quietRatio': None,
             })
             track_silence_sets.append([(tl_total_start, tl_total_end)])
@@ -1106,7 +1598,7 @@ def main():
         track_info = tracks_by_label[label]
         clip_silence, stats = analyze_track_silence(
             track_info, timebase, THRESHOLD_DB, MIN_SILENCE,
-            min_silence_frames, probe_cache)
+            min_silence_frames, probe_cache, args.multicam_audio)
 
         # このトラックの音声を1つも解析できていないなら、ここで止める。
         # 従来はWARNINGを出して続行し「無音0箇所 = カット無し」のXMLを正常出力して
@@ -1114,6 +1606,7 @@ def main():
         # 複数トラック選択時にこれを黙って「常に無音」へ倒すと、実際には解析
         # できていないのに判定に使えたかのように見えてしまう (fail-closed)。
         if stats['analyzedCount'] == 0:
+            kinds = stats.get('unresolvedKinds') or {}
             print(f"\nERROR: トラック {label} の音声を1クリップも解析できませんでした")
             print(f"  〖なぜ〗{label}の全クリップで音声ファイルを読めませんでした:")
             for reason in stats['skippedReasons']:
@@ -1121,6 +1614,10 @@ def main():
             print(f"  〖次の一手〗①{label}トラックに音声クリップ(素材の音声)が乗っているか確認"
                   " ②素材のリンク切れ(?マーク)がないか確認"
                   f" ③ネスト/マルチカムのクリップは解除して素材を直接{label}へ置く")
+            # 内訳は止まる前に必ず出す。どの種別で全滅したのかが分からないと、
+            # 利用者は4つの可能性を総当たりするしかなくなる。
+            if kinds:
+                print(f"[診断] 解析できないクリップ: {format_unresolved_breakdown(kinds)}")
             print(f"[診断] 解析不能トラック: {label}")
             sys.exit(EXIT_AUDIO_FAILED)
 
@@ -1128,6 +1625,7 @@ def main():
         total_analyzed += stats['analyzedCount']
         total_clip_count += stats['clipCount']
         all_skipped_reasons.extend(stats['skippedReasons'])
+        merge_unresolved_kinds(all_unresolved_kinds, stats.get('unresolvedKinds'))
         if stats['peakDb'] is not None:
             combined_peak_db = (stats['peakDb'] if combined_peak_db is None
                                 else max(combined_peak_db, stats['peakDb']))
@@ -1157,8 +1655,8 @@ def main():
     # パディング適用 → カット区間
     cut_regions = []
     for tf_start, tf_end in all_silence_tl_frames:
-        cs = tf_start + PADDING_FRAMES
-        ce = tf_end - PADDING_FRAMES
+        cs = tf_start + PADDING_AFTER
+        ce = tf_end - PADDING_BEFORE
         if ce > cs:
             cut_regions.append((cs, ce))
 
@@ -1175,7 +1673,7 @@ def main():
     print(f"[診断] 基準トラック: {base_track_label} / クリップ {total_clip_count}本"
           f" (解析 {total_analyzed} / スキップ {len(all_skipped_reasons)})")
     print(f"[診断] 使用した設定: 閾値 {THRESHOLD_DB}dB / 最小無音 {MIN_SILENCE}s"
-          f" ({min_silence_frames}f) / パディング {PADDING_FRAMES}f")
+          f" ({min_silence_frames}f) / パディング 後{PADDING_AFTER}f・前{PADDING_BEFORE}f")
     print(f"[診断] 音声レベル実測: peak"
           f" {'—' if combined_peak_db is None else f'{combined_peak_db:.1f}dBFS'} / RMS"
           f" {'—' if combined_rms_db is None else f'{combined_rms_db:.1f}dBFS'}"
@@ -1194,6 +1692,10 @@ def main():
             print(f"[診断] トラック{label}: peak {peak_text} / RMS {rms_text}"
                   f" / 閾値以下 {stats['quietRatio'] * 100:.1f}%"
                   f" (解析 {stats['analyzedCount']} / スキップ {len(stats['skippedReasons'])})")
+    if all_unresolved_kinds:
+        # 一部のクリップだけ解析できなかった場合の内訳 (全滅なら上で停止済み)。
+        # この区間は「無音ゼロ扱い = 残る」ので、なぜ切れないのかを数字で示す。
+        print(f"[診断] 解析できないクリップ: {format_unresolved_breakdown(all_unresolved_kinds)}")
     print(f"[診断] 検出した無音: {len(all_silence_tl_frames)}箇所"
           f" / 合計 {silence_total_frames / timebase:.2f}秒")
     print(f"[診断] カット区間: {len(cut_regions)}箇所")
@@ -1229,11 +1731,11 @@ def main():
                   "判定対象に選ぶと常に「音がある」判定になり何もカットされなくなります)")
         else:
             print(f"  〖なぜ〗無音は {len(all_silence_tl_frames)}箇所"
-                  f" 検出しましたが、前後に残す量 (パディング {PADDING_FRAMES}f×2 ="
-                  f" {PADDING_FRAMES * 2}f) が無音の長さを上回るため、"
+                  f" 検出しましたが、前後に残す量 (後{PADDING_AFTER}f + 前{PADDING_BEFORE}f"
+                  f" = {PADDING_AFTER + PADDING_BEFORE}f) が無音の長さを上回るため、"
                   "カット区間が残りませんでした")
-            print(f"  〖次の一手〗①前後に残す量を減らす (推奨: 最小無音長"
-                  f" {min_silence_frames}f の半分未満 = {max(0, min_silence_frames // 2 - 1)}f 以下)"
+            print(f"  〖次の一手〗①前後に残す量を減らす (推奨: 合計が最小無音長"
+                  f" {min_silence_frames}f 未満 = {max(0, min_silence_frames - 1)}f 以下)"
                   " ②最小無音長を長くする")
         if not args.allow_no_cut:
             print("  (--allow-no-cut を付けると、カット0件でもそのまま出力します)")

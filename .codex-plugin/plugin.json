@@ -1,0 +1,27 @@
+{
+  "name": "premiere-skills",
+  "version": "1.1.0",
+  "description": "Premiere Pro XML の無音・雑音カット(/cut)と日本語テロップ用SRT高速生成(/srt-fast)を提供するCodex & Antigravityプラグイン。",
+  "author": {
+    "name": "fuuuuuuma",
+    "url": "https://github.com/fuuuuuuma"
+  },
+  "homepage": "https://github.com/fuuuuuuma/premiere-skills",
+  "repository": "https://github.com/fuuuuuuma/premiere-skills",
+  "license": "MIT",
+  "keywords": ["premiere-pro", "video-editing", "silence-cut", "subtitles", "srt", "whisper", "mlx-whisper"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Premiere Skills (Cut & SRT)",
+    "shortDescription": "無音自動カット(/cut)・高速テロップ生成(/srt-fast)",
+    "longDescription": "Premiere Pro XMLの無音自動ジェットカット(/cut)およびApple Silicon GPU / Whisperによる高品質SRT字幕高速生成(/srt-fast)を提供します。",
+    "developerName": "fuuuuuuma",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "websiteURL": "https://github.com/fuuuuuuma/premiere-skills",
+    "defaultPrompt": [
+      "/cut /path/to/timeline.xml",
+      "/srt-fast /path/to/audio.wav"
+    ]
+  }
+}

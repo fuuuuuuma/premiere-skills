@@ -1,0 +1,10 @@
+{
+  "name": "premiere-skills",
+  "version": "1.1.0",
+  "description": "Premiere Pro XML の無音カット(/cut)と日本語テロップ用SRT高速生成(/srt-fast)を提供するAntigravity & Codexプラグイン",
+  "author": {
+    "name": "fuuuuuuma",
+    "url": "https://github.com/fuuuuuuma"
+  },
+  "skills": "./skills/"
+}
