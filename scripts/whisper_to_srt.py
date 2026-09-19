@@ -216,7 +216,9 @@ def _run_whisper_mlx(audio_path: str, cpu_threads: int = 0) -> list[dict]:
     )
 
     seg_list = []
+    raw_segments = []
     for seg in result["segments"]:
+        raw_segments.append(_raw_segment(seg["start"], seg["end"], seg["text"], seg.get("words", [])))
         raw_text = apply_corrections(seg["text"].strip())
         clean_text = remove_fillers(raw_text)
         if not clean_text:
@@ -240,6 +242,7 @@ def _run_whisper_mlx(audio_path: str, cpu_threads: int = 0) -> list[dict]:
             "words": words,
         })
 
+    seg_list = _jev_restore_meaningful_fillers(seg_list, raw_segments)
     seg_list = _rescue_gaps(audio_path, seg_list, cpu_threads)
 
     print(f"Whisperセグメント数: {len(seg_list)}")
@@ -418,7 +421,12 @@ def _fw_transcribe(model, audio_path: str) -> list[dict]:
     )
 
     seg_list = []
+    raw_segments = []
     for seg in segments:
+        raw_segments.append(_raw_segment(
+            seg.start, seg.end, seg.text,
+            [{"word": w.word, "start": w.start, "end": w.end} for w in (seg.words or [])],
+        ))
         raw_text = apply_corrections(seg.text.strip())
         clean_text = remove_fillers(raw_text)
         if not clean_text:
@@ -443,6 +451,46 @@ def _fw_transcribe(model, audio_path: str) -> list[dict]:
             "words": words,
         })
 
+    return _jev_restore_meaningful_fillers(seg_list, raw_segments)
+
+
+def _raw_segment(start, end, text, words) -> dict:
+    """補正・フィラー除去の前の区間（Jev で意味を持つ語を戻すときに前後の文脈として使う）。"""
+    return {
+        "start": start, "end": end, "text": str(text or "").strip(),
+        "words": [
+            {"word": str(w.get("word") or "").strip(), "start": w["start"], "end": w["end"]}
+            for w in words if str(w.get("word") or "").strip()
+        ],
+    }
+
+
+def _jev_restore_meaningful_fillers(seg_list: list[dict], raw_segments: list[dict]) -> list[dict]:
+    """一律に消している「もう・はい・まあ」のうち、意味を持つ語だけを戻す（任意機能・既定オフ）。
+
+    remove_fillers は Whisper の語ごとに当てるので、「もう」「ちょっと」が別の語に分かれると
+    「もう少し」を守る先読みが効かず「もうちょっと→ちょっと」「頼もう→頼」になる
+    （2026-09-19 実データの /srt-fast 出力で確認: 「ここの部分ちょっと伸ばして」「編集者に頼ってなる」）。
+    環境変数 PREMIERE_SKILLS_JEV=1 と Jev の認証情報（~/.config/jev/credentials 等）があるときだけ、
+    Jev（Cloudflare Workers AI の typesafe/jev・外部通信）に文脈つきで「消してよいか」を聞いて戻す。
+    判定できなかった語は今までどおり消す。詳細は filler_restore.py。
+    """
+    if os.environ.get("PREMIERE_SKILLS_JEV") != "1":
+        return seg_list
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import filler_restore
+        # importlib で名前を付けずに読み込まれることがあるので、sys.modules[__name__] には頼らず
+        # 必要な2つの関数だけを渡す（2026-09-19 実測: KeyError で黙って省略されていた）
+        from types import SimpleNamespace
+        text_rules = SimpleNamespace(apply_corrections=apply_corrections, remove_fillers=remove_fillers)
+        seg_list, restored = filler_restore.restore(
+            seg_list, raw_segments, text_rules, filler_restore.delete_verdicts,
+        )
+        if restored:
+            print(f"意味を持つ語を字幕に戻しました (Jev): {restored}語")
+    except Exception as exc:  # noqa: BLE001 — Jev が使えなくても転写は止めない
+        print(f"[WARN] 語の戻し (Jev) を省略: {exc}")
     return seg_list
 
 

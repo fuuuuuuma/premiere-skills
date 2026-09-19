@@ -62,3 +62,17 @@ codex plugin add premiere-skills@premiere-skills
 - Python 3.9 以降
 - `ffmpeg` (`brew install ffmpeg`)
 - `mlx-whisper` または `faster-whisper` (`pip3 install --user mlx-whisper faster-whisper`)
+
+## 任意機能: 意味のある「もう」を字幕に残す（Jev・既定オフ）
+
+字幕を作る前に「もう」「はい」「まあ」を言い淀みとして消しています。Whisper の語ごとに消すため、
+「もうちょっと」「もう一回」「頼もう」の「もう」まで消えることがあります（例: 「ここの部分ちょっと伸ばして」）。
+
+次の2つがそろったときだけ、消す前に Jev（Cloudflare Workers AI の `typesafe/jev`）へ前後の文脈つきで
+「消してよいか」を聞き、意味を持つ語を残します。**字幕の文の一部が Cloudflare に送られます。**
+
+1. 環境変数 `PREMIERE_SKILLS_JEV=1`
+2. 認証情報 `~/.config/jev/credentials`（`JEV_CF_ACCOUNT_ID=` と `JEV_CF_API_TOKEN=` の2行。Workers AI の APIトークン）
+
+料金は Cloudflare AI Gateway のクレジットから引かれます（10分の動画で1円未満）。判定できなかった語や、
+設定が無いときは今までどおり消します。
