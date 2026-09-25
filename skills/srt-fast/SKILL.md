@@ -26,14 +26,23 @@ description: WAV/動画音声を単一パスGPU転写（mlx-whisper）した後�
 ### Step 1: 環境とスクリプト解決
 
 ```bash
-# プラグイン同梱スクリプト優先解決
-PREPARE_SCRIPT="$(find "$HOME/.gemini/config/plugins" "$HOME/.codex/plugins/cache" -maxdepth 7 -type f -name prepare_text_parts.py 2>/dev/null | head -1)"
-if [ -z "$PREPARE_SCRIPT" ] || [ ! -f "$PREPARE_SCRIPT" ]; then
-  PREPARE_SCRIPT="$HOME/.claude/scripts/chunk_tools/prepare_text_parts.py"
+# プラグイン本体の場所を決める（この順で探し、最初に見つかったものを使う）
+# Claude Code は ${CLAUDE_PLUGIN_ROOT} をプラグインの実パスに展開する。Codex / Antigravity は展開しない。
+ROOT="${CLAUDE_PLUGIN_ROOT:-/nonexistent}"
+if [ ! -f "$ROOT/scripts/whisper_to_srt.py" ]; then
+  # 同じプラグインの複数版がキャッシュに残ることがあるので、更新の新しいものを選ぶ
+  HIT="$(find "$HOME/.claude/plugins" "$HOME/.codex/plugins/cache" "$HOME/.gemini/config/plugins" \
+         -maxdepth 8 -type f -name whisper_to_srt.py -path '*premiere-skills*' -print0 2>/dev/null \
+         | xargs -0 ls -t 2>/dev/null | head -1)"
+  [ -n "$HIT" ] && ROOT="$(cd "$(dirname "$HIT")/.." && pwd)"
 fi
-SCRIPTS_DIR="$(dirname "$PREPARE_SCRIPT")/.."
+[ -f "$ROOT/scripts/whisper_to_srt.py" ] || { echo "premiere-skills のスクリプトが見つかりません。プラグインを入れ直してください"; exit 1; }
+
+SCRIPTS_DIR="$ROOT/scripts"
+PREPARE_SCRIPT="$SCRIPTS_DIR/chunk_tools/prepare_text_parts.py"
 WHISPER_SCRIPT="$SCRIPTS_DIR/whisper_to_srt.py"
-RULES_FILE="$(dirname "$SCRIPTS_DIR")/references/srt_runtime_rules.md"
+RULES_FILE="$ROOT/references/srt_runtime_rules.md"
+echo "premiere-skills: $ROOT"
 
 OUT_ROOT="$(dirname "<入力ファイルの絶対パス>")"
 ```

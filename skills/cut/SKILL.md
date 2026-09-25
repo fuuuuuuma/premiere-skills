@@ -36,11 +36,21 @@ command -v ffmpeg >/dev/null 2>&1 && echo "ffmpeg: OK" || echo "ffmpeg: 未導�
 ## スクリプト解決と実行
 
 ```bash
-# スクリプトの解決（プラグイン内優先）
-SCRIPT="$(find "$HOME/.gemini/config/plugins" "$HOME/.codex/plugins/cache" -maxdepth 6 -type f -name silence_cut.py 2>/dev/null | head -1)"
-if [ -z "$SCRIPT" ] || [ ! -f "$SCRIPT" ]; then
-  SCRIPT="$HOME/.claude/scripts/silence_cut.py"
+# プラグイン本体の場所を決める（この順で探し、最初に見つかったものを使う）
+# Claude Code は ${CLAUDE_PLUGIN_ROOT} をプラグインの実パスに展開する。Codex / Antigravity は展開しない。
+ROOT="${CLAUDE_PLUGIN_ROOT:-/nonexistent}"
+if [ ! -f "$ROOT/scripts/silence_cut.py" ]; then
+  # 同じプラグインの複数版がキャッシュに残ることがあるので、更新の新しいものを選ぶ
+  HIT="$(find "$HOME/.claude/plugins" "$HOME/.codex/plugins/cache" "$HOME/.gemini/config/plugins" \
+         -maxdepth 8 -type f -name silence_cut.py -path '*premiere-skills*' -print0 2>/dev/null \
+         | xargs -0 ls -t 2>/dev/null | head -1)"
+  [ -n "$HIT" ] && ROOT="$(cd "$(dirname "$HIT")/.." && pwd)"
 fi
+
+SCRIPT="$ROOT/scripts/silence_cut.py"
+[ -f "$SCRIPT" ] || SCRIPT="$HOME/.claude/scripts/silence_cut.py"   # 手で配置した既存環境
+[ -f "$SCRIPT" ] || { echo "silence_cut.py が見つかりません。プラグインを入れ直してください"; exit 1; }
+echo "silence_cut: $SCRIPT"
 
 XML_PATH="<XMLファイルの絶対パス>"
 OUT_DIR="$(dirname "$XML_PATH")/output/cut"

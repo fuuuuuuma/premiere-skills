@@ -3,36 +3,31 @@
 Premiere Pro 動画編集ワークフローを自動化するスキル集です。
 無音・雑音区間の自動ジェットカット（`/cut`）および、Apple Silicon GPU / Whisper を用いた高速SRT字幕生成（`/srt-fast`）を同梱しています。
 
-**Antigravity** および **Codex** の両環境でプラグインとして動作します。
+**Grok Build**、**Antigravity**、**Codex** の各環境でプラグインとして動作します。
 
 ---
 
-## Antigravity への導入コード
+## 導入方法
 
-### 1. ターミナルで実行する場合（1行で即時導入）
+### 1. Grok Build で導入する場合（1行で即時導入）
+```bash
+grok plugin install fuuuuuuma/premiere-skills --trust
+```
+
+### 2. Antigravity で導入する場合
+#### ターミナルで実行:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fuuuuuuma/premiere-skills/main/install.sh | bash
 ```
 
-または Git と `agy` CLI を使う場合:
-```bash
-git clone --depth 1 https://github.com/fuuuuuuma/premiere-skills.git /tmp/premiere-skills && \
-agy plugin install /tmp/premiere-skills && \
-rm -rf /tmp/premiere-skills
-```
-
-### 2. Antigravity チャットに投げて導入させる場合
-以下のプロンプトを Antigravity のチャットにそのまま送信してください：
-
+#### または Antigravity チャットに投げるプロンプト:
 ```text
-以下のコマンドを実行して、GitHubの premiere-skills プラグインを Antigravity に導入してください。
+以下のコマンドを実行して、GitHubの premiere-skills プラグイン（/cut と /srt-fast）を Antigravity に導入してください。
+
 curl -fsSL https://raw.githubusercontent.com/fuuuuuuma/premiere-skills/main/install.sh | bash
 ```
 
----
-
-## Codex への導入コマンド
-
+### 3. Codex で導入する場合
 ```bash
 codex plugin marketplace add fuuuuuuma/premiere-skills
 codex plugin add premiere-skills@premiere-skills
@@ -62,17 +57,3 @@ codex plugin add premiere-skills@premiere-skills
 - Python 3.9 以降
 - `ffmpeg` (`brew install ffmpeg`)
 - `mlx-whisper` または `faster-whisper` (`pip3 install --user mlx-whisper faster-whisper`)
-
-## 任意機能: 意味のある「もう」を字幕に残す（Jev・既定オフ）
-
-字幕を作る前に「もう」「はい」「まあ」を言い淀みとして消しています。Whisper の語ごとに消すため、
-「もうちょっと」「もう一回」「頼もう」の「もう」まで消えることがあります（例: 「ここの部分ちょっと伸ばして」）。
-
-次の2つがそろったときだけ、消す前に Jev（Cloudflare Workers AI の `typesafe/jev`）へ前後の文脈つきで
-「消してよいか」を聞き、意味を持つ語を残します。**字幕の文の一部が Cloudflare に送られます。**
-
-1. 環境変数 `PREMIERE_SKILLS_JEV=1`
-2. 認証情報 `~/.config/jev/credentials`（`JEV_CF_ACCOUNT_ID=` と `JEV_CF_API_TOKEN=` の2行。Workers AI の APIトークン）
-
-料金は Cloudflare AI Gateway のクレジットから引かれます（10分の動画で1円未満）。判定できなかった語や、
-設定が無いときは今までどおり消します。

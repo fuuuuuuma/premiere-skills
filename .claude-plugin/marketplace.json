@@ -1,8 +1,12 @@
 {
   "name": "premiere-skills",
-  "description": "Premiere Pro 動画編集ワークフローを Claude Code で自動化するスキル集（/cut・/srt-fast）",
-  "owner": { "name": "fuuuuuuma" },
+  "description": "Premiere Pro の無音カット（/cut）と日本語テロップ用の高速SRT字幕生成（/srt-fast）を Claude Code / Codex / Antigravity で使えるようにするスキル集",
+  "owner": { "name": "fuuuuuuma", "url": "https://github.com/fuuuuuuma" },
   "plugins": [
-    { "name": "premiere-skills", "source": "./" }
+    {
+      "name": "premiere-skills",
+      "source": "./",
+      "description": "無音・雑音の自動ジェットカット（/cut）と、GPU転写による日本語SRT字幕の高速生成（/srt-fast）"
+    }
   ]
 }
